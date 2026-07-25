@@ -1,17 +1,36 @@
 import hashlib
+import io
+import os
+import pickle
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import av
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from huggingface_hub import HfFileSystem, hf_hub_download
+from torch.utils.data import DataLoader
 
 from fastvideo.configs.configs import DatasetType, PreprocessConfig, VideoLoaderType
+from fastvideo.fastvideo_args import WorkloadType
+from fastvideo.pipelines.preprocess.preprocess_stages import VideoTransformStage
 from fastvideo.utils import FlexibleArgumentParser
 from fastvideo.workflow.preprocess import vidaforge_manifest
 from fastvideo.workflow.preprocess.components import VideoForwardBatchBuilder, build_dataset
+
+_VIDAFORGE_RELEASE_REVISION = "091bdc02d82b8c89a4e4eff54945d286fb328b47"
+_VIDAFORGE_HEVC_SMOKE_CLIP_ID = "video-9a2221ec0d47d85c:clip:00002:02"
+
+
+def _identity_collate(batch):
+    return batch
+
+
+def _keep_all(_row):
+    return True
 
 
 def _write_parquet(path: Path, rows: list[dict]) -> None:
@@ -51,6 +70,7 @@ def _row(
     clip_path: str,
     clip_ok: int = 1,
     caption_ok: int = 1,
+    select_ok: int = 1,
     select_pass: int = 1,
     caption_level_0: str = "short caption",
     caption_level_3: str = "dense caption",
@@ -64,6 +84,7 @@ def _row(
         "clip_path": clip_path,
         "clip_ok": clip_ok,
         "caption_ok": caption_ok,
+        "select_ok": select_ok,
         "select_pass": select_pass,
         "width": width,
         "height": height,
@@ -75,10 +96,11 @@ def _row(
 
 
 def _config(manifest_path: Path, *, data_root: Path | None = None, **kwargs) -> PreprocessConfig:
+    video_loader_type = kwargs.pop("video_loader_type", VideoLoaderType.TORCHVISION)
     return PreprocessConfig(
         dataset_path=str(manifest_path),
         dataset_type=DatasetType.VIDAFORGE,
-        video_loader_type=VideoLoaderType.TORCHVISION,
+        video_loader_type=video_loader_type,
         vidaforge_data_root="" if data_root is None else str(data_root),
         **kwargs,
     )
@@ -107,7 +129,7 @@ def _release_row(
         fps=fps,
         duration_sec=duration_sec,
     )
-    for field in ("clip_ok", "caption_ok", "select_pass"):
+    for field in ("clip_ok", "caption_ok", "select_ok", "select_pass"):
         del row[field]
     row.update({
         "tar_path": tar_path,
@@ -219,6 +241,10 @@ def test_build_vidaforge_dataset_filters_status_and_empty_caption(tmp_path: Path
         ("caption-failed", {
             "caption_ok": 0
         }),
+        ("selection-failed", {
+            "select_ok": 0,
+            "select_pass": 0,
+        }),
         ("selection-rejected", {
             "select_pass": 0
         }),
@@ -264,10 +290,20 @@ def test_build_vidaforge_dataset_selection_modes(
 ):
     data_root = tmp_path / "vidaforge"
     rows = []
-    for clip_id, select_pass in [("passed", 1), ("rejected", 0)]:
+    for clip_id, select_ok, select_pass in [
+        ("passed", 1, 1),
+        ("rejected", 1, 0),
+        ("selection-error", 0, 0),
+    ]:
         relative_path = f"data/{clip_id}.mp4"
         _video_path(data_root, relative_path)
-        rows.append(_row(clip_id=clip_id, clip_path=relative_path, select_pass=select_pass))
+        rows.append(
+            _row(
+                clip_id=clip_id,
+                clip_path=relative_path,
+                select_ok=select_ok,
+                select_pass=select_pass,
+            ))
     manifest_path = tmp_path / "clip-00000.parquet"
     _write_parquet(manifest_path, rows)
 
@@ -394,7 +430,7 @@ def test_build_vidaforge_release_materializes_indexed_tar_clip(tmp_path: Path):
     data_root = tmp_path / "VidaForge-3M"
     clip_path = "00/00/clip.mp4"
     tar_path = "data/shard-00000.tar"
-    _, tar_offset, filesize_bytes, sha256 = _indexed_tar(
+    tar_file, tar_offset, filesize_bytes, sha256 = _indexed_tar(
         data_root,
         source_video,
         clip_path=clip_path,
@@ -427,16 +463,146 @@ def test_build_vidaforge_release_materializes_indexed_tar_clip(tmp_path: Path):
         validator=lambda row: True,
     )
 
-    materialized_path = (materialize_dir / clip_path).resolve()
+    assert not materialize_dir.exists()
+    rows = list(dataset)
+    assert len(rows) == 1
+    materialized_path = Path(rows[0]["video"])
     assert materialized_path.read_bytes() == source_video.read_bytes()
-    assert dataset[0]["video"] == str(materialized_path)
-    assert dataset[0]["name"] == "release-clip"
-    assert dataset[0]["resolution"] == {
+    assert materialized_path.parent == materialize_dir.resolve() / sha256[:2]
+    assert materialized_path.name == f"{sha256}.mp4"
+    assert rows[0]["name"] == "release-clip"
+    assert rows[0]["resolution"] == {
         "width": 40,
         "height": 30,
     }
-    assert dataset[0]["fps"] == 25.0
-    assert dataset[0]["num_frames"] == 5
+    assert rows[0]["fps"] == 25.0
+    assert rows[0]["num_frames"] == 5
+    tar_file.unlink()
+    cached_rows = list(dataset)
+    assert cached_rows[0]["video"] == str(materialized_path)
+
+
+def test_build_vidaforge_release_streams_verified_bytes_for_torchcodec(tmp_path: Path):
+    source_video = _video_path(tmp_path, "source.mp4", frame_count=5, fps=25)
+    data_root = tmp_path / "VidaForge-3M"
+    _, tar_offset, filesize_bytes, sha256 = _indexed_tar(data_root, source_video)
+    manifest_path = data_root / "meta" / "shard-00000.parquet"
+    _write_parquet(
+        manifest_path,
+        [
+            _release_row(
+                clip_id="release-clip",
+                clip_path="00/00/clip.mp4",
+                tar_path="data/shard-00000.tar",
+                tar_offset=tar_offset,
+                filesize_bytes=filesize_bytes,
+                sha256=sha256,
+            )
+        ],
+    )
+    output_dir = tmp_path / "output"
+
+    dataset = build_dataset(
+        _config(
+            manifest_path,
+            data_root=data_root,
+            dataset_output_dir=str(output_dir),
+            video_loader_type=VideoLoaderType.TORCHCODEC,
+        ),
+        split="train",
+        validator=lambda row: True,
+    )
+
+    assert not output_dir.exists()
+    rows = list(dataset)
+    video = rows[0]["video"]
+    assert isinstance(video, vidaforge_manifest.VidaForgeTorchCodecVideo)
+    assert video.source == source_video.read_bytes()
+    restored_video = pickle.loads(pickle.dumps(video))
+    assert restored_video.source == video.source
+    assert not output_dir.exists()
+
+
+@pytest.mark.skipif(
+    os.environ.get("VIDAFORGE_RUN_OFFICIAL_HEVC_SMOKE") != "1",
+    reason="set VIDAFORGE_RUN_OFFICIAL_HEVC_SMOKE=1 to download and decode one official clip",
+)
+def test_vidaforge_official_hevc_torchcodec_pipeline_smoke(tmp_path: Path):
+    metadata_path = hf_hub_download(
+        repo_id="VidaForge/VidaForge-3M",
+        filename="meta/shard-00000.parquet",
+        repo_type="dataset",
+        revision=_VIDAFORGE_RELEASE_REVISION,
+    )
+    official_rows = pq.read_table(
+        metadata_path,
+        filters=[("clip_id", "=", _VIDAFORGE_HEVC_SMOKE_CLIP_ID)],
+    ).to_pylist()
+    assert len(official_rows) == 1
+    official_row = official_rows[0]
+
+    remote_tar_path = (
+        f"datasets/VidaForge/VidaForge-3M@{_VIDAFORGE_RELEASE_REVISION}/{official_row['tar_path']}")
+    with HfFileSystem().open(remote_tar_path, "rb") as tar_handle:
+        tar_handle.seek(official_row["tar_offset"])
+        payload_chunks = []
+        remaining = official_row["filesize_bytes"]
+        while remaining > 0:
+            chunk = tar_handle.read(remaining)
+            assert chunk
+            payload_chunks.append(chunk)
+            remaining -= len(chunk)
+    payload = b"".join(payload_chunks)
+    assert len(payload) == official_row["filesize_bytes"]
+    assert hashlib.sha256(payload).hexdigest() == official_row["sha256"]
+    with av.open(io.BytesIO(payload)) as container:
+        assert container.streams.video[0].codec_context.name == "hevc"
+
+    data_root = tmp_path / "VidaForge-3M"
+    sample_tar_path = data_root / "data" / "official-hevc-sample.tar"
+    sample_tar_path.parent.mkdir(parents=True)
+    sample_tar_path.write_bytes(b"\0" * 512 + payload)
+    smoke_row = dict(official_row)
+    smoke_row["tar_path"] = "data/official-hevc-sample.tar"
+    smoke_row["tar_offset"] = 512
+    manifest_path = data_root / "meta" / "official-hevc-sample.parquet"
+    _write_parquet(manifest_path, [smoke_row])
+    output_dir = tmp_path / "output"
+    config = _config(
+        manifest_path,
+        data_root=data_root,
+        dataset_output_dir=str(output_dir),
+        video_loader_type=VideoLoaderType.TORCHCODEC,
+        dataloader_num_workers=1,
+        preprocess_video_batch_size=1,
+    )
+    dataset = build_dataset(config, split="train", validator=_keep_all)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=1,
+        num_workers=1,
+        collate_fn=_identity_collate,
+    )
+    raw_batch = next(iter(dataloader))
+    preprocess_batch = VideoForwardBatchBuilder(seed=7)(raw_batch)
+    stage = VideoTransformStage(
+        train_fps=25,
+        num_frames=4,
+        max_height=64,
+        max_width=64,
+        do_temporal_sample=False,
+    )
+    result = stage.forward(
+        preprocess_batch,
+        SimpleNamespace(
+            preprocess_config=config,
+            workload_type=WorkloadType.T2V,
+        ),
+    )
+
+    assert result.latents is not None
+    assert tuple(result.latents.shape) == (1, 3, 4, 64, 64)
+    assert not output_dir.exists()
 
 
 def test_build_vidaforge_release_uses_extracted_clip(tmp_path: Path):
@@ -470,8 +636,9 @@ def test_build_vidaforge_release_uses_extracted_clip(tmp_path: Path):
         validator=lambda row: True,
     )
 
-    assert dataset[0]["video"] == str(extracted_video.resolve())
-    assert dataset[0]["num_frames"] == 6
+    rows = list(dataset)
+    assert rows[0]["video"] == str(extracted_video.resolve())
+    assert rows[0]["num_frames"] == 6
 
 
 @pytest.mark.parametrize("selection", ["pass", "reject"])
@@ -521,16 +688,18 @@ def test_build_vidaforge_release_rejects_checksum_mismatch(tmp_path: Path):
         ],
     )
 
+    dataset = build_dataset(
+        _config(
+            manifest_path,
+            data_root=data_root,
+            vidaforge_materialize_dir=str(tmp_path / "materialized"),
+        ),
+        split="train",
+        validator=lambda row: True,
+    )
+
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
-        build_dataset(
-            _config(
-                manifest_path,
-                data_root=data_root,
-                vidaforge_materialize_dir=str(tmp_path / "materialized"),
-            ),
-            split="train",
-            validator=lambda row: True,
-        )
+        list(dataset)
 
 
 def test_build_vidaforge_release_requires_data_root(tmp_path: Path):
@@ -564,6 +733,35 @@ def test_build_vidaforge_dataset_rejects_empty_distributed_shard(tmp_path: Path,
         build_dataset(_config(manifest_path), split="train", validator=lambda row: True)
 
 
+def test_build_vidaforge_release_shards_rows_across_dataloader_workers(tmp_path: Path, monkeypatch):
+    data_root = tmp_path / "VidaForge-3M"
+    rows = []
+    for index in range(4):
+        clip_path = f"00/00/clip-{index}.mp4"
+        video_path = _video_path(data_root / "data", clip_path)
+        payload = video_path.read_bytes()
+        rows.append(
+            _release_row(
+                clip_id=f"release-{index}",
+                clip_path=clip_path,
+                tar_path="data/missing.tar",
+                tar_offset=512,
+                filesize_bytes=len(payload),
+                sha256=hashlib.sha256(payload).hexdigest(),
+            ))
+    manifest_path = data_root / "meta" / "shard-00000.parquet"
+    _write_parquet(manifest_path, rows)
+    monkeypatch.setattr(vidaforge_manifest, "get_worker_info", lambda: SimpleNamespace(num_workers=2, id=1))
+
+    dataset = build_dataset(
+        _config(manifest_path, data_root=data_root),
+        split="train",
+        validator=lambda row: True,
+    )
+
+    assert [row["name"] for row in dataset] == ["release-2", "release-3"]
+
+
 def test_build_vidaforge_dataset_rejects_duplicate_clip_ids(tmp_path: Path):
     data_root = tmp_path / "vidaforge"
     first_path = "data/first.mp4"
@@ -581,6 +779,27 @@ def test_build_vidaforge_dataset_rejects_duplicate_clip_ids(tmp_path: Path):
 
     with pytest.raises(ValueError, match="duplicate clip_id"):
         build_dataset(_config(manifest_path, data_root=data_root), split="train", validator=lambda row: True)
+
+
+def test_build_vidaforge_release_rejects_duplicate_materialization_paths(tmp_path: Path):
+    manifest_path = tmp_path / "shard-00000.parquet"
+    _write_parquet(
+        manifest_path,
+        [
+            _release_row(
+                clip_id=f"release-{index}",
+                clip_path="00/00/shared.mp4",
+                tar_path="data/shard-00000.tar",
+                tar_offset=512 + index * 100,
+                filesize_bytes=100,
+                sha256=str(index) * 64,
+            )
+            for index in range(2)
+        ],
+    )
+
+    with pytest.raises(ValueError, match="duplicate clip_path"):
+        build_dataset(_config(manifest_path, data_root=tmp_path), split="train", validator=lambda row: True)
 
 
 def test_build_vidaforge_dataset_has_no_validation_split(tmp_path: Path):

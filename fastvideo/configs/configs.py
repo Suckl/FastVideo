@@ -127,7 +127,7 @@ class PreprocessConfig:
             f"--{prefix_with_dot}vidaforge-materialize-dir",
             type=str,
             default=PreprocessConfig.vidaforge_materialize_dir,
-            help="Cache for clips read from VidaForge-3M indexed TAR shards (defaults under dataset_output_dir).")
+            help="Optional persistent cache for clips read from VidaForge-3M indexed TAR shards.")
         preprocess_args.add_argument(f"--{prefix_with_dot}vidaforge-caption-field",
                                      type=str,
                                      default=PreprocessConfig.vidaforge_caption_field,

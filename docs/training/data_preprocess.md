@@ -127,7 +127,7 @@ Stage 4 input requires:
 
 - `clip_id`, `clip_path`, `clip_ok`
 - `width`, `height`, `fps`, `duration_sec`
-- `select_pass`, `caption_ok`
+- `select_ok`, `select_pass`, `caption_ok`
 - the column selected by `vidaforge_caption_field`
 
 #### Public VidaForge-3M release
@@ -155,7 +155,6 @@ torchrun --nproc_per_node=1 \
     --preprocess.dataset-path \
         "/data/VidaForge-3M/meta/shard-00000.parquet" \
     --preprocess.vidaforge-data-root "/data/VidaForge-3M" \
-    --preprocess.vidaforge-materialize-dir "/scratch/vidaforge_clips" \
     --preprocess.vidaforge-caption-field caption_level_3 \
     --preprocess.vidaforge-selection auto \
     --preprocess.dataset-output-dir "/data/fastvideo_processed" \
@@ -167,19 +166,30 @@ torchrun --nproc_per_node=1 \
 
 Public release metadata includes `tar_path`, `tar_offset`, `filesize_bytes`,
 and `sha256`. If `<vidaforge_data_root>/data/<clip_path>` already exists,
-FastVideo uses and verifies that extracted clip. Otherwise it reads only that
-clip's byte range from the paired uncompressed TAR, verifies its SHA-256, and
-atomically materializes it under `vidaforge_materialize_dir`. The default
-materialization directory is `.vidaforge_clips` under `dataset_output_dir`.
+FastVideo uses and verifies that extracted clip. Otherwise the default
+TorchCodec path lazily reads only the requested clip's byte range from the
+paired uncompressed TAR, verifies its SHA-256, and decodes the verified bytes
+without creating a persistent copy. The input is sharded across distributed
+ranks and DataLoader workers before video bytes are read.
+
+Set `vidaforge_materialize_dir` to opt into a persistent, content-addressed
+clip cache. The Torchvision loader requires files and therefore materializes
+clips automatically; when no cache path is configured, it uses
+`.vidaforge_clips` under `dataset_output_dir`. Cached files are written
+atomically. A persistent cache can grow to roughly the size of the downloaded
+TAR data, so place it on storage with enough space or omit it when using
+TorchCodec.
 
 `vidaforge_selection` accepts `auto` (the default), `pass`, `reject`, or `all`.
 For Stage 4, `auto` means `pass`. For the public release, whose selection
 decisions are intentionally omitted, `auto` means `all`; `pass` and `reject`
 are rejected rather than silently applying the wrong selection policy.
-Stage 4 rows with `clip_ok != 1`, `caption_ok != 1`, or an empty selected
-caption are excluded.
+Stage 4 rows with `clip_ok != 1`, `caption_ok != 1`, `select_ok != 1`, or an
+empty selected caption are excluded. Checking `select_ok` prevents selection
+worker failures from being treated as ordinary rejected clips.
 
-FastVideo probes each selected MP4 for its actual width, height, FPS, and frame
+FastVideo probes each selected MP4 for its container-indexed width, height,
+FPS, and frame count, decoding to count frames when the container omits that
 count. It does not derive frame count from `fps * duration_sec`, because
 VidaForge clip timing and container duration can differ by one frame.
 The recommended `torchcodec` loader requires compatible FFmpeg shared
@@ -189,8 +199,21 @@ if its native library cannot be loaded.
 
 The contract is based on VidaForge revision
 [`4562d3f`](https://github.com/GAIR-NLP/VidaForge/tree/4562d3fbcbd4861fc74c2859950c0237363681bb).
-The public release contains about 2.2 TiB of video, so start with one paired
-shard and place the materialization directory on storage with enough space.
+The public release contains about 2.2 TiB of HEVC video, so install an FFmpeg
+build with HEVC decoding and start with one paired shard. A full persistent
+run needs space for the downloaded TARs, the optional materialized cache, and
+FastVideo's processed output; the default in-memory TorchCodec path avoids the
+extra clip cache.
+
+To verify the exact decoder path without downloading a full TAR shard, run
+the opt-in smoke test on Linux. It fetches one pinned official metadata row
+and only that HEVC clip's byte range:
+
+```bash
+VIDAFORGE_RUN_OFFICIAL_HEVC_SMOKE=1 \
+pytest fastvideo/tests/workflow/test_vidaforge_manifest.py \
+    -k official_hevc_torchcodec_pipeline_smoke -vs
+```
 
 ## Creating Your Own Dataset
 

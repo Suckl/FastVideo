@@ -9,6 +9,7 @@ import numpy as np
 import pyarrow as pa
 import torch
 from datasets import Dataset, Video, load_dataset
+from torch.utils.data import IterableDataset
 
 from fastvideo.configs.configs import (DatasetType, PreprocessConfig, VideoLoaderType)
 from fastvideo.dataset.dataloader.parquet_io import (ParquetDatasetWriter, records_to_table)
@@ -240,8 +241,8 @@ class ParquetDatasetSaver:
         self.clean_up()
 
 
-def build_dataset(preprocess_config: PreprocessConfig, split: str, validator: Callable[[dict[str, Any]],
-                                                                                       bool]) -> Dataset:
+def build_dataset(preprocess_config: PreprocessConfig, split: str,
+                  validator: Callable[[dict[str, Any]], bool]) -> Dataset | IterableDataset:
     if preprocess_config.dataset_type == DatasetType.HF:
         dataset = load_dataset(preprocess_config.dataset_path, split=split)
         dataset = dataset.filter(validator)
