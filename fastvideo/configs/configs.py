@@ -15,6 +15,7 @@ class DatasetType(str, Enum):
     """
     HF = "hf"
     MERGED = "merged"
+    VIDAFORGE = "vidaforge"
 
     @classmethod
     def from_string(cls, value: str) -> "DatasetType":
@@ -62,6 +63,10 @@ class PreprocessConfig:
     dataset_path: str = ""
     dataset_type: DatasetType = DatasetType.HF
     dataset_output_dir: str = "./output"
+    vidaforge_data_root: str = ""
+    vidaforge_materialize_dir: str = ""
+    vidaforge_caption_field: str = "caption_level_3"
+    vidaforge_selection: str = "auto"
 
     # Dataloader configuration
     dataloader_num_workers: int = 1
@@ -113,6 +118,25 @@ class PreprocessConfig:
                                      type=str,
                                      default=PreprocessConfig.dataset_output_dir,
                                      help="The output directory where the dataset will be written.")
+        preprocess_args.add_argument(
+            f"--{prefix_with_dot}vidaforge-data-root",
+            type=str,
+            default=PreprocessConfig.vidaforge_data_root,
+            help="VidaForge DATA_DIR or downloaded VidaForge-3M root used to resolve videos and TAR shards.")
+        preprocess_args.add_argument(
+            f"--{prefix_with_dot}vidaforge-materialize-dir",
+            type=str,
+            default=PreprocessConfig.vidaforge_materialize_dir,
+            help="Cache for clips read from VidaForge-3M indexed TAR shards (defaults under dataset_output_dir).")
+        preprocess_args.add_argument(f"--{prefix_with_dot}vidaforge-caption-field",
+                                     type=str,
+                                     default=PreprocessConfig.vidaforge_caption_field,
+                                     help="VidaForge caption column to use as the training caption.")
+        preprocess_args.add_argument(f"--{prefix_with_dot}vidaforge-selection",
+                                     type=str,
+                                     choices=["auto", "pass", "reject", "all"],
+                                     default=PreprocessConfig.vidaforge_selection,
+                                     help="VidaForge selection partition to preprocess.")
 
         # Dataloader
         preprocess_args.add_argument(
@@ -207,6 +231,11 @@ class PreprocessConfig:
     def check_preprocess_config(self) -> None:
         if self.dataset_path == "":
             raise ValueError("dataset_path must be set for preprocess mode")
+        if self.dataset_type == DatasetType.VIDAFORGE:
+            if not self.vidaforge_caption_field.strip():
+                raise ValueError("vidaforge_caption_field must not be empty")
+            if self.vidaforge_selection not in {"auto", "pass", "reject", "all"}:
+                raise ValueError("vidaforge_selection must be one of: auto, pass, reject, all")
         if self.samples_per_file <= 0:
             raise ValueError("samples_per_file must be greater than 0")
         if self.flush_frequency <= 0:

@@ -15,6 +15,7 @@ from fastvideo.dataset.dataloader.parquet_io import (ParquetDatasetWriter, recor
 from fastvideo.distributed.parallel_state import get_world_rank, get_world_size
 from fastvideo.logger import init_logger
 from fastvideo.pipelines.pipeline_batch_info import PreprocessBatch
+from fastvideo.workflow.preprocess.vidaforge_manifest import build_vidaforge_dataset
 
 logger = init_logger(__name__)
 
@@ -90,7 +91,7 @@ class PreprocessingDataValidator:
 
         frame_interval = batch["fps"] / self.train_fps
         start_frame_idx = 0
-        frame_indices = np.arange(start_frame_idx, batch["num_frames"], frame_interval).astype(int)
+        frame_indices: np.ndarray = np.arange(start_frame_idx, batch["num_frames"], frame_interval).astype(int)
         return not (len(frame_indices) < self.num_frames and random.random() < self.drop_short_ratio)
 
     def log_validation_stats(self):
@@ -267,6 +268,8 @@ def build_dataset(preprocess_config: PreprocessConfig, split: str, validator: Ca
         dataset = dataset.map(add_video_column)
         if preprocess_config.video_loader_type == VideoLoaderType.TORCHCODEC:
             dataset = dataset.cast_column("video", Video())
+    elif preprocess_config.dataset_type == DatasetType.VIDAFORGE:
+        dataset = build_vidaforge_dataset(preprocess_config, split=split, validator=validator)
     else:
         raise ValueError(f"Invalid dataset type: {preprocess_config.dataset_type}")
 

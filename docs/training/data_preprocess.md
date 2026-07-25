@@ -52,7 +52,7 @@ torchrun --nproc_per_node=$GPU_NUM \
 | Parameter | Description |
 |-----------|-------------|
 | `--workload_type` | Task type: `t2v` (text-to-video) or `i2v` (image-to-video) |
-| `--preprocess.dataset_type` | Input format: `hf` (HuggingFace) or `merged` (local folder) |
+| `--preprocess.dataset_type` | Input format: `hf`, `merged`, or `vidaforge` |
 | `--preprocess.dataset_path` | Path to dataset (HF repo ID or local folder) |
 | `--preprocess.dataset_output_dir` | Output directory for Parquet files |
 | `--preprocess.video_loader_type` | Video decoder: `torchcodec` or `torchvision` |
@@ -87,6 +87,110 @@ The `videos2caption.json` maps video filenames to captions:
 ### HuggingFace Dataset
 
 Use `--preprocess.dataset_type hf` and point `--preprocess.dataset_path` to a HuggingFace dataset with `video` and `caption` columns.
+
+### VidaForge Manifest
+
+[VidaForge](https://github.com/GAIR-NLP/VidaForge) turns raw videos into
+standardized, segmented, selected, and annotated clips. FastVideo can consume
+either the local Parquet shards produced by VidaForge Stage 4 Caption or Tag,
+or locally downloaded paired Parquet/indexed-TAR shards from the public
+[VidaForge-3M dataset](https://huggingface.co/datasets/VidaForge/VidaForge-3M).
+It does not use VidaForge Stage 5 encoded `.meta` files.
+
+#### Stage 4 workspace
+
+Point `dataset_path` at one Stage 4 Parquet file or at the run directory that
+directly contains `clip-*.parquet`. VidaForge stores `clip_path` relative to
+its `DATA_DIR`, so pass that directory as `vidaforge_data_root`:
+
+```bash
+torchrun --nproc_per_node=1 \
+    -m fastvideo.pipelines.preprocess.v1_preprocessing_new \
+    --model-path "Wan-AI/Wan2.1-T2V-1.3B-Diffusers" \
+    --mode preprocess \
+    --workload-type t2v \
+    --preprocess.video-loader-type torchcodec \
+    --preprocess.dataset-type vidaforge \
+    --preprocess.dataset-path \
+        "/data/meta/stage4_annotation/step2_caption/run_id_demo" \
+    --preprocess.vidaforge-data-root "/data" \
+    --preprocess.vidaforge-caption-field caption_level_3 \
+    --preprocess.vidaforge-selection auto \
+    --preprocess.dataset-output-dir "/data/fastvideo_processed" \
+    --preprocess.max-height 480 \
+    --preprocess.max-width 832 \
+    --preprocess.num-frames 77 \
+    --preprocess.train-fps 16
+```
+
+Stage 4 input requires:
+
+- `clip_id`, `clip_path`, `clip_ok`
+- `width`, `height`, `fps`, `duration_sec`
+- `select_pass`, `caption_ok`
+- the column selected by `vidaforge_caption_field`
+
+#### Public VidaForge-3M release
+
+Download one paired shard for a smoke run:
+
+```bash
+hf download VidaForge/VidaForge-3M \
+    data/shard-00000.tar \
+    meta/shard-00000.parquet \
+    --repo-type dataset \
+    --local-dir "/data/VidaForge-3M"
+```
+
+Then preprocess that metadata shard:
+
+```bash
+torchrun --nproc_per_node=1 \
+    -m fastvideo.pipelines.preprocess.v1_preprocessing_new \
+    --model-path "Wan-AI/Wan2.1-T2V-1.3B-Diffusers" \
+    --mode preprocess \
+    --workload-type t2v \
+    --preprocess.video-loader-type torchcodec \
+    --preprocess.dataset-type vidaforge \
+    --preprocess.dataset-path \
+        "/data/VidaForge-3M/meta/shard-00000.parquet" \
+    --preprocess.vidaforge-data-root "/data/VidaForge-3M" \
+    --preprocess.vidaforge-materialize-dir "/scratch/vidaforge_clips" \
+    --preprocess.vidaforge-caption-field caption_level_3 \
+    --preprocess.vidaforge-selection auto \
+    --preprocess.dataset-output-dir "/data/fastvideo_processed" \
+    --preprocess.max-height 480 \
+    --preprocess.max-width 832 \
+    --preprocess.num-frames 77 \
+    --preprocess.train-fps 16
+```
+
+Public release metadata includes `tar_path`, `tar_offset`, `filesize_bytes`,
+and `sha256`. If `<vidaforge_data_root>/data/<clip_path>` already exists,
+FastVideo uses and verifies that extracted clip. Otherwise it reads only that
+clip's byte range from the paired uncompressed TAR, verifies its SHA-256, and
+atomically materializes it under `vidaforge_materialize_dir`. The default
+materialization directory is `.vidaforge_clips` under `dataset_output_dir`.
+
+`vidaforge_selection` accepts `auto` (the default), `pass`, `reject`, or `all`.
+For Stage 4, `auto` means `pass`. For the public release, whose selection
+decisions are intentionally omitted, `auto` means `all`; `pass` and `reject`
+are rejected rather than silently applying the wrong selection policy.
+Stage 4 rows with `clip_ok != 1`, `caption_ok != 1`, or an empty selected
+caption are excluded.
+
+FastVideo probes each selected MP4 for its actual width, height, FPS, and frame
+count. It does not derive frame count from `fps * duration_sec`, because
+VidaForge clip timing and container duration can differ by one frame.
+The recommended `torchcodec` loader requires compatible FFmpeg shared
+libraries; follow the
+[TorchCodec installation guide](https://github.com/meta-pytorch/torchcodec#installing-torchcodec)
+if its native library cannot be loaded.
+
+The contract is based on VidaForge revision
+[`4562d3f`](https://github.com/GAIR-NLP/VidaForge/tree/4562d3fbcbd4861fc74c2859950c0237363681bb).
+The public release contains about 2.2 TiB of video, so start with one paired
+shard and place the materialization directory on storage with enough space.
 
 ## Creating Your Own Dataset
 
