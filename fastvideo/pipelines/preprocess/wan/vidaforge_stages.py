@@ -14,9 +14,11 @@ import torchvision
 from einops import rearrange
 
 from fastvideo.configs.configs import VideoLoaderType
+from fastvideo.distributed import get_local_torch_device
 from fastvideo.fastvideo_args import FastVideoArgs
+from fastvideo.models.vaes.common import ParallelTiledVAE
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch, PreprocessBatch
-from fastvideo.pipelines.stages import TextEncodingStage
+from fastvideo.pipelines.stages import EncodingStage, TextEncodingStage
 from fastvideo.pipelines.stages.base import PipelineStage
 
 
@@ -81,8 +83,12 @@ class VidaForgeWanVideoTransformStage(PipelineStage):
         videos: list[torch.Tensor] = []
         for loader in preprocess_batch.video_loader:
             if fastvideo_args.preprocess_config.video_loader_type == VideoLoaderType.TORCHCODEC:
-                frame_indices = self._frame_indices(len(loader))
-                video = loader.get_frames_at(frame_indices).data
+                official_decode = getattr(loader, "get_vidaforge_wan_frames", None)
+                if callable(official_decode):
+                    video = official_decode(self.num_frames)
+                else:
+                    frame_indices = self._frame_indices(len(loader))
+                    video = loader.get_frames_at(frame_indices).data
             elif fastvideo_args.preprocess_config.video_loader_type == VideoLoaderType.TORCHVISION:
                 video, _, _ = torchvision.io.read_video(loader, output_format="TCHW")
                 frame_indices = self._frame_indices(int(video.shape[0]))
@@ -135,9 +141,40 @@ class VidaForgeWanVideoTransformStage(PipelineStage):
         )
 
 
+class VidaForgeWanEncodingStage(EncodingStage):
+    """Encode with VidaForge's explicit FP16 VAE input semantics."""
+
+    vae: ParallelTiledVAE
+
+    def __init__(self, vae: ParallelTiledVAE) -> None:
+        super().__init__(vae)
+
+    @torch.no_grad()
+    def forward(self, batch: ForwardBatch, fastvideo_args: FastVideoArgs) -> ForwardBatch:
+        if fastvideo_args.pipeline_config.vae_precision != "fp16":
+            raise ValueError("VidaForge Wan encoding requires an FP16 VAE")
+        if fastvideo_args.pipeline_config.vae_tiling:
+            raise ValueError("VidaForge Wan encoding does not support VAE tiling")
+        if batch.latents is None or not isinstance(batch.latents, torch.Tensor):
+            raise ValueError("VidaForge Wan encoding requires a pixel tensor")
+
+        device = get_local_torch_device()
+        self.vae = self.vae.to(device)
+        video_tensor = (batch.latents * 2.0 - 1.0).clamp(-1, 1).to(
+            device=device,
+            dtype=torch.float16,
+        )
+        batch.latents = self.vae.encode(video_tensor).mean
+
+        if fastvideo_args.vae_cpu_offload:
+            self.vae.to("cpu")
+        return batch
+
+
 __all__ = [
     "VidaForgeTextEncodingStage",
     "VidaForgeTextTransformStage",
+    "VidaForgeWanEncodingStage",
     "VidaForgeWanVideoTransformStage",
     "clean_vidaforge_prompt",
 ]

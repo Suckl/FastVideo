@@ -162,11 +162,12 @@ def _wan_normalize(latents: torch.Tensor, vae: Any) -> torch.Tensor:
         std_value = getattr(config, "latents_std", None)
     if mean_value is None or std_value is None:
         raise ValueError("Wan VAE must expose latents_mean and latents_std")
-    mean = torch.as_tensor(mean_value, dtype=torch.float32, device=latents.device).view(1, -1, 1, 1, 1)
-    std = torch.as_tensor(std_value, dtype=torch.float32, device=latents.device).view(1, -1, 1, 1, 1)
+    official_latents = latents.to(dtype=torch.float16)
+    mean = torch.as_tensor(mean_value, dtype=torch.float16, device=latents.device).view(1, -1, 1, 1, 1)
+    std = torch.as_tensor(std_value, dtype=torch.float16, device=latents.device).view(1, -1, 1, 1, 1)
     if mean.shape[1] != latents.shape[1] or std.shape[1] != latents.shape[1] or torch.any(std <= 0):
         raise ValueError("Wan VAE latent normalization statistics do not match encoded channels")
-    return (latents.float() - mean) / std
+    return (official_latents - mean) / std
 
 
 def _validated_text_mask(

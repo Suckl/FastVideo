@@ -22,11 +22,13 @@ from fastvideo.fastvideo_args import WorkloadType
 from fastvideo.pipelines.pipeline_batch_info import PreprocessBatch
 from fastvideo.pipelines.preprocess.wan.wan_preprocess_pipelines import PreprocessPipelineT2V
 from fastvideo.workflow.preprocess.vidaforge_automodel_writer import (
+    _wan_normalize,
     build_model_provenance,
     VidaForgeAutoModelWriter,
 )
 from fastvideo.pipelines.preprocess.wan.vidaforge_stages import (
     clean_vidaforge_prompt,
+    VidaForgeWanEncodingStage,
     VidaForgeWanVideoTransformStage,
 )
 from fastvideo.workflow.preprocess.preprocess_workflow import PreprocessWorkflow
@@ -253,6 +255,99 @@ def test_vidaforge_video_stage_samples_across_complete_clip() -> None:
     assert sampled_values == [0.0, 2.0, 4.0, 6.0, 8.0]
 
 
+def test_vidaforge_video_stage_prefers_official_cuda_decode() -> None:
+
+    class _Video:
+
+        def __init__(self) -> None:
+            self.requested_frame_count: int | None = None
+
+        def get_vidaforge_wan_frames(self, frame_count: int) -> torch.Tensor:
+            self.requested_frame_count = frame_count
+            return torch.zeros((frame_count, 3, 16, 16), dtype=torch.uint8)
+
+        def __len__(self) -> int:
+            raise AssertionError("the generic decoder must not be used")
+
+    video = _Video()
+    batch = PreprocessBatch(
+        data_type="video",
+        video_loader=[video],
+        fps=[24.0],
+        num_frames=[9],
+        height=[16],
+        width=[16],
+    )
+    stage = VidaForgeWanVideoTransformStage(
+        num_frames=5,
+        max_height=16,
+        max_width=16,
+    )
+    stage.forward(
+        batch,
+        SimpleNamespace(
+            preprocess_config=SimpleNamespace(
+                video_loader_type=VideoLoaderType.TORCHCODEC, ), ),  # type: ignore[arg-type]
+    )
+
+    assert video.requested_frame_count == 5
+
+
+def test_wan_normalization_uses_official_fp16_arithmetic() -> None:
+    latents = torch.tensor([[[[[0.1234]]]]], dtype=torch.float32)
+    vae = SimpleNamespace(latents_mean=[0.3333], latents_std=[0.07])
+
+    normalized = _wan_normalize(latents, vae)
+    expected = (
+        latents.to(torch.float16) - torch.tensor([0.3333], dtype=torch.float16).view(1, 1, 1, 1, 1)
+    ) / torch.tensor([0.07], dtype=torch.float16).view(1, 1, 1, 1, 1)
+
+    assert normalized.dtype == torch.float16
+    assert torch.equal(normalized, expected)
+
+
+def test_vidaforge_wan_encoding_uses_explicit_fp16_input(monkeypatch: pytest.MonkeyPatch) -> None:
+
+    class _VAE:
+
+        def __init__(self) -> None:
+            self.encoded: torch.Tensor | None = None
+
+        def to(self, _device):
+            return self
+
+        def encode(self, value: torch.Tensor):
+            self.encoded = value
+            return SimpleNamespace(mean=torch.ones((1, 1, 1, 1, 1), dtype=value.dtype))
+
+    vae = _VAE()
+    stage = VidaForgeWanEncodingStage(vae=vae)  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        "fastvideo.pipelines.preprocess.wan.vidaforge_stages.get_local_torch_device",
+        lambda: torch.device("cpu"),
+    )
+    batch = PreprocessBatch(
+        data_type="video",
+        latents=torch.tensor([[[[[0.25]]]]], dtype=torch.float32),
+    )
+    result = stage.forward(
+        batch,
+        SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                vae_precision="fp16",
+                vae_tiling=False,
+            ),
+            vae_cpu_offload=False,
+        ),  # type: ignore[arg-type]
+    )
+
+    assert vae.encoded is not None
+    assert vae.encoded.dtype == torch.float16
+    assert vae.encoded.item() == -0.5
+    assert result.latents is not None
+    assert result.latents.dtype == torch.float16
+
+
 def test_vidaforge_prompt_cleanup_matches_double_html_unescape() -> None:
     assert clean_vidaforge_prompt("  one &amp;amp; two\n three  ") == "one & two three"
 
@@ -461,3 +556,4 @@ def test_wan_t2v_pipeline_activates_vidaforge_producer_stages() -> None:
     assert pipeline.text_transform_stage.__class__.__name__ == "VidaForgeTextTransformStage"
     assert pipeline.prompt_encoding_stage.__class__.__name__ == "VidaForgeTextEncodingStage"
     assert pipeline.video_transform_stage.__class__.__name__ == "VidaForgeWanVideoTransformStage"
+    assert pipeline.video_encoding_stage.__class__.__name__ == "VidaForgeWanEncodingStage"

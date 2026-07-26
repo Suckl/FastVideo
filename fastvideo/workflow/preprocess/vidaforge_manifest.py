@@ -83,6 +83,31 @@ class VidaForgeTorchCodecVideo:
 
         return VideoDecoder(self.source).get_frames_at(indices)
 
+    def get_vidaforge_wan_frames(self, frame_count: int) -> Any:
+        """Decode the exact frame batch used by VidaForge's Wan producer."""
+        import torch
+        from torchcodec.decoders import VideoDecoder, set_cuda_backend
+
+        decoder_kwargs = {
+            "dimension_order": "NCHW",
+            "device": "cuda",
+            "seek_mode": "exact",
+            "num_ffmpeg_threads": 1,
+        }
+        with set_cuda_backend("beta"):
+            decoder = VideoDecoder(self.source, **decoder_kwargs)
+        input_frame_count = len(decoder)
+        if input_frame_count < frame_count:
+            raise ValueError(
+                f"VidaForge producer requires at least {frame_count} decoded frames, got {input_frame_count}")
+        frame_indices = torch.linspace(
+            0,
+            input_frame_count - 1,
+            steps=frame_count,
+            dtype=torch.float64,
+        ).round().to(dtype=torch.int64)
+        return decoder.get_frames_at(frame_indices).data.contiguous()
+
     def __len__(self) -> int:
         from torchcodec.decoders import VideoDecoder
 

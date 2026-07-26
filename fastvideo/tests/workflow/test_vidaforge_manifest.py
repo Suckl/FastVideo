@@ -4,8 +4,9 @@ import os
 import pickle
 import sys
 import tarfile
+from contextlib import nullcontext
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import av
@@ -13,6 +14,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import torch
 from huggingface_hub import HfFileSystem, hf_hub_download
 from torch.utils.data import DataLoader
 
@@ -778,6 +780,46 @@ def test_ltx2_audio_resolves_file_backed_vidaforge_torchcodec_source(tmp_path: P
 
     assert resolve_file_backed_video_path(file_backed) == video_path
     assert resolve_file_backed_video_path(in_memory) is None
+
+
+def test_vidaforge_wan_decode_uses_official_cuda_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    frames = np.arange(5 * 3 * 2 * 2, dtype=np.uint8).reshape(5, 3, 2, 2)
+
+    class _Decoder:
+
+        def __init__(self, source: object, **kwargs: object) -> None:
+            captured["source"] = source
+            captured["kwargs"] = kwargs
+
+        def __len__(self) -> int:
+            return len(frames)
+
+        def get_frames_at(self, indices):
+            captured["indices"] = indices.tolist()
+            return SimpleNamespace(data=torch.from_numpy(frames[indices.tolist()]))
+
+    backend = MagicMock(return_value=nullcontext())
+    torchcodec_module = ModuleType("torchcodec")
+    decoders_module = ModuleType("torchcodec.decoders")
+    decoders_module.VideoDecoder = _Decoder  # type: ignore[attr-defined]
+    decoders_module.set_cuda_backend = backend  # type: ignore[attr-defined]
+    torchcodec_module.decoders = decoders_module  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torchcodec", torchcodec_module)
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders_module)
+
+    decoded = vidaforge_manifest.VidaForgeTorchCodecVideo("clip.mp4").get_vidaforge_wan_frames(3)
+
+    backend.assert_called_once_with("beta")
+    assert captured["source"] == "clip.mp4"
+    assert captured["kwargs"] == {
+        "dimension_order": "NCHW",
+        "device": "cuda",
+        "seek_mode": "exact",
+        "num_ffmpeg_threads": 1,
+    }
+    assert captured["indices"] == [0, 2, 4]
+    assert decoded.is_contiguous()
 
 
 @pytest.mark.skipif(

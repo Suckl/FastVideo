@@ -48,6 +48,7 @@ class PreprocessPipelineT2V(ComposedPipelineBase):
             from fastvideo.pipelines.preprocess.wan.vidaforge_stages import (
                 VidaForgeTextEncodingStage,
                 VidaForgeTextTransformStage,
+                VidaForgeWanEncodingStage,
                 VidaForgeWanVideoTransformStage,
             )
             text_transform_stage = VidaForgeTextTransformStage()
@@ -60,6 +61,7 @@ class PreprocessPipelineT2V(ComposedPipelineBase):
                 max_height=fastvideo_args.preprocess_config.max_height,
                 max_width=fastvideo_args.preprocess_config.max_width,
             )
+            video_encoding_stage = VidaForgeWanEncodingStage(vae=self.get_module("vae"))
         else:
             text_transform_stage = TextTransformStage(
                 cfg_uncondition_drop_rate=fastvideo_args.preprocess_config.training_cfg_rate,
@@ -76,10 +78,11 @@ class PreprocessPipelineT2V(ComposedPipelineBase):
                 max_width=fastvideo_args.preprocess_config.max_width,
                 do_temporal_sample=fastvideo_args.preprocess_config.do_temporal_sample,
             )
+            video_encoding_stage = EncodingStage(vae=self.get_module("vae"))
         self.add_stage(stage_name="text_transform_stage", stage=text_transform_stage)
         self.add_stage(stage_name="prompt_encoding_stage", stage=text_encoding_stage)
         self.add_stage(stage_name="video_transform_stage", stage=video_transform_stage)
-        self.add_stage(stage_name="video_encoding_stage", stage=EncodingStage(vae=self.get_module("vae"), ))
+        self.add_stage(stage_name="video_encoding_stage", stage=video_encoding_stage)
 
 
 EntryClass = [PreprocessPipelineI2V, PreprocessPipelineT2V]
