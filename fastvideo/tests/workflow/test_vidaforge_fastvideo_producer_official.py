@@ -74,6 +74,10 @@ def test_fastvideo_wan_producer_encodes_official_release_clip(tmp_path: Path) ->
         [
             sys.executable,
             "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=1",
+            "-m",
             "fastvideo.pipelines.preprocess.v1_preprocessing_new",
             "--model-path",
             _MODEL_NAME,
