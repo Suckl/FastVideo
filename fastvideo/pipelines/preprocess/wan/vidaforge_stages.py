@@ -20,6 +20,7 @@ from fastvideo.models.vaes.common import ParallelTiledVAE
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch, PreprocessBatch
 from fastvideo.pipelines.stages import EncodingStage, TextEncodingStage
 from fastvideo.pipelines.stages.base import PipelineStage
+from fastvideo.workflow.preprocess.vidaforge_manifest import VIDAFORGE_WAN_MAX_TEMPORAL_REPEAT_PAD_FRAMES
 
 
 def clean_vidaforge_prompt(prompt: str) -> str:
@@ -122,9 +123,11 @@ class VidaForgeWanVideoTransformStage(PipelineStage):
         return preprocess_batch
 
     def _frame_indices(self, input_frame_count: int) -> list[int]:
-        if input_frame_count < self.num_frames:
-            raise ValueError(
-                f"VidaForge producer requires at least {self.num_frames} decoded frames, got {input_frame_count}")
+        if (input_frame_count <= 0
+                or self.num_frames - input_frame_count > VIDAFORGE_WAN_MAX_TEMPORAL_REPEAT_PAD_FRAMES):
+            raise ValueError(f"VidaForge producer requires at least "
+                             f"{self.num_frames - VIDAFORGE_WAN_MAX_TEMPORAL_REPEAT_PAD_FRAMES} decoded frames for a "
+                             f"{self.num_frames}-frame bucket, got {input_frame_count}")
         return (torch.linspace(
             0,
             input_frame_count - 1,

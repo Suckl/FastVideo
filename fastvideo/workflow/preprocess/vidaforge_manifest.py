@@ -60,6 +60,7 @@ _RELEASE_REQUIRED_COLUMNS = frozenset({
 })
 _COPY_CHUNK_SIZE = 8 * 1024 * 1024
 _METADATA_CACHE_VERSION = 1
+VIDAFORGE_WAN_MAX_TEMPORAL_REPEAT_PAD_FRAMES = 3
 
 
 class VidaForgeManifestKind(str, Enum):
@@ -97,16 +98,17 @@ class VidaForgeTorchCodecVideo:
         with set_cuda_backend("beta"):
             decoder = VideoDecoder(self.source, **decoder_kwargs)
         input_frame_count = len(decoder)
-        if input_frame_count < frame_count:
+        if input_frame_count <= 0 or frame_count - input_frame_count > VIDAFORGE_WAN_MAX_TEMPORAL_REPEAT_PAD_FRAMES:
             raise ValueError(
-                f"VidaForge producer requires at least {frame_count} decoded frames, got {input_frame_count}")
+                f"VidaForge producer requires at least {frame_count - VIDAFORGE_WAN_MAX_TEMPORAL_REPEAT_PAD_FRAMES} "
+                f"decoded frames for a {frame_count}-frame bucket, got {input_frame_count}")
         frame_indices = torch.linspace(
             0,
             input_frame_count - 1,
             steps=frame_count,
             dtype=torch.float64,
         ).round().to(dtype=torch.int64)
-        return decoder.get_frames_at(frame_indices).data.contiguous()
+        return decoder.get_frames_at(frame_indices.tolist()).data.contiguous()
 
     def __len__(self) -> int:
         from torchcodec.decoders import VideoDecoder
@@ -128,6 +130,18 @@ def resolve_vidaforge_parquet_paths(dataset_path: str | Path) -> list[Path]:
     if not parquet_paths:
         raise FileNotFoundError(f"No Parquet shards found directly under VidaForge dataset path: {path}")
     return parquet_paths
+
+
+def build_vidaforge_manifest_fingerprint(dataset_path: str | Path) -> str:
+    """Hash all manifest shards so a resumable cache is bound to one input revision."""
+    digest = hashlib.sha256()
+    digest.update(b"fastvideo-vidaforge-manifest-v1\0")
+    for path in resolve_vidaforge_parquet_paths(dataset_path):
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(_sha256_file(path).encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _detect_manifest_kind(dataset: Dataset, caption_field: str) -> VidaForgeManifestKind:

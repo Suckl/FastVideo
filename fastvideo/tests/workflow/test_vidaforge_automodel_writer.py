@@ -25,6 +25,7 @@ from fastvideo.pipelines.preprocess.wan.wan_preprocess_pipelines import Preproce
 from fastvideo.workflow.preprocess.vidaforge_automodel_writer import (
     _wan_normalize,
     build_model_provenance,
+    build_vidaforge_source_fingerprint,
     VidaForgeAutoModelWriter,
 )
 from fastvideo.pipelines.preprocess.wan.vidaforge_stages import (
@@ -47,6 +48,8 @@ def _producer_config(**overrides: object) -> dict[str, object]:
         "workload_type": "t2v",
         "pipeline_config": "WanT2V480PConfig",
         "caption_field": "caption_level_3",
+        "vidaforge_selection": "auto",
+        "manifest_fingerprint": "d" * 64,
         "video_loader_type": "torchcodec",
         "max_height": 16,
         "max_width": 16,
@@ -78,7 +81,22 @@ def _write_model(root: Path) -> None:
     (root / "tokenizer" / "spiece.model").write_bytes(b"tokenizer-vocabulary")
 
 
-def _batch(clip_id: str) -> PreprocessBatch:
+def _source_item(clip_id: str, *, caption: str = "a test caption", video: bytes = b"video") -> dict[str, object]:
+    return {
+        "clip_id": clip_id,
+        "video": video,
+        "caption": caption,
+        "resolution": {
+            "width": 32,
+            "height": 24,
+        },
+        "fps": 24.0,
+        "num_frames": 12,
+    }
+
+
+def _batch(clip_id: str, *, caption: str = "a test caption", video: bytes = b"video") -> PreprocessBatch:
+    source_fingerprint = build_vidaforge_source_fingerprint(_source_item(clip_id, caption=caption, video=video))
     return PreprocessBatch(
         data_type="video",
         latents=torch.tensor([[[[[3.0]]], [[[6.0]]]]]),
@@ -99,7 +117,8 @@ def _batch(clip_id: str) -> PreprocessBatch:
                 "source_resolution": [32, 24],
                 "source_fps": 24.0,
                 "source_frame_count": 12,
-                "caption": "a test caption",
+                "caption": caption,
+                "source_fingerprint": source_fingerprint,
             }],
         },
     )
@@ -255,6 +274,22 @@ def test_vidaforge_video_stage_samples_across_complete_clip() -> None:
     assert isinstance(result.latents, torch.Tensor)
     sampled_values = (result.latents[0, 0, :, 0, 0] * 255).tolist()
     assert sampled_values == [0.0, 2.0, 4.0, 6.0, 8.0]
+
+
+def test_vidaforge_video_stage_repeats_at_most_three_missing_frames() -> None:
+    stage = VidaForgeWanVideoTransformStage(
+        num_frames=17,
+        max_height=16,
+        max_width=16,
+    )
+
+    indices = stage._frame_indices(14)
+
+    assert len(indices) == 17
+    assert indices[0] == 0
+    assert indices[-1] == 13
+    with pytest.raises(ValueError, match="at least 14 decoded frames"):
+        stage._frame_indices(13)
 
 
 def test_vidaforge_video_stage_prefers_official_cuda_decode() -> None:
@@ -414,11 +449,15 @@ def test_resume_skips_completed_clip_and_rejects_changed_model(tmp_path: Path) -
     first.publish()
 
     resumed = _writer(output_dir, model_root, generation="c" * 32, resume=True)
-    assert resumed.pending_items([{"clip_id": "clip-1"}, {"clip_id": "clip-2"}]) == [{
-        "clip_id": "clip-2"
-    }]
+    pending_input = [_source_item("clip-1"), _source_item("clip-2")]
+    pending = resumed.pending_items(pending_input)
+    assert pending == [pending_input[1]]
     resumed.write_rank_progress()
     assert resumed.publish() == 1
+
+    changed_source = _writer(output_dir, model_root, generation="5" * 32, resume=True)
+    with pytest.raises(ValueError, match="caption, media, or source metadata changed"):
+        changed_source.pending_items([_source_item("clip-1", caption="updated caption")])
 
     with pytest.raises(ValueError, match="different producer_config_fingerprint"):
         _writer(
@@ -428,10 +467,39 @@ def test_resume_skips_completed_clip_and_rejects_changed_model(tmp_path: Path) -
             resume=True,
             producer_config=_producer_config(train_fps=24),
         )
+    with pytest.raises(ValueError, match="different producer_config_fingerprint"):
+        _writer(
+            output_dir,
+            model_root,
+            generation="6" * 32,
+            resume=True,
+            producer_config=_producer_config(vidaforge_selection="all"),
+        )
 
     (model_root / "text_encoder" / "config.json").write_text('{"changed":true}', encoding="utf-8")
     with pytest.raises(ValueError, match="different text_encoder_fingerprint"):
         _writer(output_dir, model_root, generation="f" * 32, resume=True)
+
+
+def test_resume_publishes_only_items_seen_in_current_manifest(tmp_path: Path) -> None:
+    model_root = tmp_path / "model"
+    output_dir = tmp_path / "cache"
+    _write_model(model_root)
+    first = _writer(output_dir, model_root, generation="7" * 32)
+    vae = SimpleNamespace(latents_mean=[1.0, 2.0], latents_std=[2.0, 4.0])
+    first.save_batch(_batch("clip-1"), vae=vae)
+    first.save_batch(_batch("clip-2"), vae=vae)
+    first.write_rank_progress()
+    assert first.publish() == 2
+
+    resumed = _writer(output_dir, model_root, generation="8" * 32, resume=True)
+    assert resumed.pending_items([_source_item("clip-1")]) == []
+    resumed.write_rank_progress()
+    assert resumed.publish() == 1
+
+    root = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    items = json.loads((output_dir / root["shards"][0]).read_text(encoding="utf-8"))
+    assert [item["clip_id"] for item in items] == ["clip-1"]
 
 
 def test_resume_rejects_payload_that_disagrees_with_index(tmp_path: Path) -> None:
@@ -487,6 +555,40 @@ def test_resume_rejects_tampered_text_mask(
 
     with pytest.raises(ValueError, match=message):
         _writer(output_dir, model_root, generation="4" * 32, resume=True)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("video_latents", torch.full((1, 2, 1, 1, 1), float("nan"), dtype=torch.float16), "finite FP16"),
+        ("text_embeddings", torch.ones((1, 3, 8), dtype=torch.float32), "finite BF16"),
+    ],
+)
+def test_resume_rejects_tampered_tensor_contract(
+    tmp_path: Path,
+    field: str,
+    value: torch.Tensor,
+    message: str,
+) -> None:
+    model_root = tmp_path / "model"
+    output_dir = tmp_path / "cache"
+    _write_model(model_root)
+    first = _writer(output_dir, model_root, generation="9" * 32)
+    first.save_batch(
+        _batch("clip-1"),
+        vae=SimpleNamespace(latents_mean=[1.0, 2.0], latents_std=[2.0, 4.0]),
+    )
+    first.write_rank_progress()
+    first.publish()
+    root = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    item = json.loads((output_dir / root["shards"][0]).read_text(encoding="utf-8"))[0]
+    path = output_dir / item["cache_file"]
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    payload[field] = value
+    torch.save(payload, path)
+
+    with pytest.raises(ValueError, match=message):
+        _writer(output_dir, model_root, generation="a" * 32, resume=True)
 
 
 def test_publish_merges_distributed_rank_progress(tmp_path: Path) -> None:
@@ -553,6 +655,11 @@ def test_vidaforge_automodel_config_requires_deterministic_wan_geometry() -> Non
 
     valid.drop_short_ratio = 0.0
     with pytest.raises(ValueError, match="drop_short_ratio=1"):
+        valid.check_preprocess_config()
+
+    valid.drop_short_ratio = 1.0
+    valid.video_loader_type = VideoLoaderType.TORCHVISION
+    with pytest.raises(ValueError, match="requires video_loader_type=torchcodec"):
         valid.check_preprocess_config()
 
 

@@ -31,7 +31,11 @@ from fastvideo.pipelines.preprocess.preprocess_stages import (
 )
 from fastvideo.utils import FlexibleArgumentParser
 from fastvideo.workflow.preprocess import vidaforge_manifest
-from fastvideo.workflow.preprocess.components import VideoForwardBatchBuilder, build_dataset
+from fastvideo.workflow.preprocess.components import (
+    VidaForgeWanDataValidator,
+    VideoForwardBatchBuilder,
+    build_dataset,
+)
 from fastvideo.workflow.preprocess.preprocess_workflow_t2v import PreprocessWorkflowT2V
 
 _VIDAFORGE_RELEASE_REVISION = "091bdc02d82b8c89a4e4eff54945d286fb328b47"
@@ -199,6 +203,41 @@ def _single_process_world(monkeypatch):
 def test_dataset_type_accepts_vidaforge():
     assert DatasetType.from_string("VIDAFORGE") == DatasetType.VIDAFORGE
     assert "vidaforge" in DatasetType.choices()
+
+
+def test_manifest_fingerprint_changes_with_manifest_content(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "manifest.parquet"
+    _write_parquet(manifest_path, [_row(clip_id="clip-a", clip_path="a.mp4")])
+    first = vidaforge_manifest.build_vidaforge_manifest_fingerprint(manifest_path)
+
+    _write_parquet(manifest_path, [_row(clip_id="clip-a", clip_path="a.mp4", caption_level_3="updated")])
+    second = vidaforge_manifest.build_vidaforge_manifest_fingerprint(manifest_path)
+
+    assert len(first) == 64
+    assert first != second
+
+
+@pytest.mark.parametrize(
+    ("decoded_frames", "expected"),
+    [
+        (17, True),
+        (14, True),
+        (13, False),
+    ],
+)
+def test_vidaforge_wan_validator_uses_decoded_frame_contract(decoded_frames: int, expected: bool) -> None:
+    validator = VidaForgeWanDataValidator(num_frames=17)
+    row = {
+        "caption": "caption",
+        "fps": 120.0,
+        "num_frames": decoded_frames,
+        "resolution": {
+            "width": 256,
+            "height": 144,
+        },
+    }
+
+    assert validator(row) is expected
 
 
 def test_vidaforge_cli_options_populate_preprocess_config():
@@ -796,8 +835,9 @@ def test_vidaforge_wan_decode_uses_official_cuda_contract(monkeypatch: pytest.Mo
             return len(frames)
 
         def get_frames_at(self, indices):
-            captured["indices"] = indices.tolist()
-            return SimpleNamespace(data=torch.from_numpy(frames[indices.tolist()]))
+            index_values = indices.tolist() if hasattr(indices, "tolist") else list(indices)
+            captured["indices"] = index_values
+            return SimpleNamespace(data=torch.from_numpy(frames[index_values]))
 
     backend = MagicMock(return_value=nullcontext())
     torchcodec_module = ModuleType("torchcodec")

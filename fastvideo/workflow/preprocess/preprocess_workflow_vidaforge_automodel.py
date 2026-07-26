@@ -12,6 +12,7 @@ from tqdm import tqdm
 from fastvideo.distributed import get_world_group, get_world_rank, get_world_size
 from fastvideo.logger import init_logger
 from fastvideo.pipelines.pipeline_batch_info import PreprocessBatch
+from fastvideo.workflow.preprocess.vidaforge_manifest import build_vidaforge_manifest_fingerprint
 from fastvideo.workflow.preprocess.preprocess_workflow_t2v import PreprocessWorkflowT2V
 from fastvideo.workflow.preprocess.vidaforge_automodel_writer import VidaForgeAutoModelWriter
 
@@ -62,6 +63,10 @@ class PreprocessWorkflowVidaForgeAutoModel(PreprocessWorkflowT2V):
                 self.fastvideo_args.pipeline_config.__class__.__name__,
                 "caption_field":
                 config.vidaforge_caption_field.strip(),
+                "vidaforge_selection":
+                config.vidaforge_selection,
+                "manifest_fingerprint":
+                build_vidaforge_manifest_fingerprint(config.dataset_path),
                 "video_loader_type":
                 config.video_loader_type.value,
                 "max_height":

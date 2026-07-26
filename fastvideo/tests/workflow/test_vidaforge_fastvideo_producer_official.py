@@ -111,8 +111,6 @@ def test_fastvideo_wan_producer_encodes_official_release_clip(tmp_path: Path) ->
             "17",
             "--preprocess.train-fps",
             "16",
-            "--preprocess.video-length-tolerance-range",
-            "100",
             "--preprocess.drop-short-ratio",
             "1",
             "--preprocess.preprocess-video-batch-size",

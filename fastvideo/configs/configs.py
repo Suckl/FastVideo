@@ -282,6 +282,9 @@ class PreprocessConfig:
         if self.output_type == PreprocessOutputType.VIDAFORGE_AUTOMODEL:
             if self.dataset_type != DatasetType.VIDAFORGE:
                 raise ValueError("vidaforge_automodel output currently requires dataset_type=vidaforge")
+            if self.video_loader_type != VideoLoaderType.TORCHCODEC:
+                raise ValueError("vidaforge_automodel output requires video_loader_type=torchcodec "
+                                 "to match VidaForge's CUDA exact-seek decoder")
             if not self.vidaforge_model_name.strip():
                 raise ValueError("vidaforge_model_name is required for vidaforge_automodel output")
             if self.training_cfg_rate != 0:

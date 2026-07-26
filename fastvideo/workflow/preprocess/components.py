@@ -106,6 +106,24 @@ class PreprocessingDataValidator:
         logger.info(info)
 
 
+class VidaForgeWanDataValidator(PreprocessingDataValidator):
+    """Validate the decoded-frame contract used by VidaForge's Wan producer."""
+
+    def __init__(self, *, num_frames: int) -> None:
+        super().__init__(num_frames=num_frames)
+
+    def register_validators(self) -> None:
+        self.add_validator("data_type_validator", self._validate_data_type)
+        self.add_validator("resolution_validator", self._validate_resolution)
+        self.add_validator("decoded_frame_validator", self._validate_decoded_frame_count)
+
+    def _validate_decoded_frame_count(self, batch: dict[str, Any]) -> bool:
+        from fastvideo.workflow.preprocess.vidaforge_manifest import (
+            VIDAFORGE_WAN_MAX_TEMPORAL_REPEAT_PAD_FRAMES, )
+
+        return int(batch["num_frames"]) >= self.num_frames - VIDAFORGE_WAN_MAX_TEMPORAL_REPEAT_PAD_FRAMES
+
+
 class VideoForwardBatchBuilder:
 
     def __init__(self, seed: int):
@@ -141,6 +159,8 @@ class VideoForwardBatchBuilder:
             int(item["num_frames"]),
             "caption":
             str(item["caption"]),
+            "source_fingerprint":
+            item.get("_vidaforge_source_fingerprint"),
         } for item in batch]
         return forward_batch
 

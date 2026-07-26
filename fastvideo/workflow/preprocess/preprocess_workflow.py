@@ -11,7 +11,8 @@ from fastvideo.fastvideo_args import FastVideoArgs, WorkloadType
 from fastvideo.logger import init_logger
 from fastvideo.pipelines.pipeline_registry import PipelineType
 from fastvideo.workflow.preprocess.components import (ParquetDatasetSaver, PreprocessingDataValidator,
-                                                      VideoForwardBatchBuilder, build_dataset)
+                                                      VidaForgeWanDataValidator, VideoForwardBatchBuilder,
+                                                      build_dataset)
 from fastvideo.workflow.workflow_base import WorkflowBase
 
 logger = init_logger(__name__)
@@ -34,15 +35,18 @@ class PreprocessWorkflow(WorkflowBase):
         preprocess_config: PreprocessConfig = self.fastvideo_args.preprocess_config
 
         # raw data validator
-        raw_data_validator = PreprocessingDataValidator(
-            max_height=preprocess_config.max_height,
-            max_width=preprocess_config.max_width,
-            num_frames=preprocess_config.num_frames,
-            train_fps=preprocess_config.train_fps,
-            speed_factor=preprocess_config.speed_factor,
-            video_length_tolerance_range=preprocess_config.video_length_tolerance_range,
-            drop_short_ratio=preprocess_config.drop_short_ratio,
-        )
+        if preprocess_config.output_type == PreprocessOutputType.VIDAFORGE_AUTOMODEL:
+            raw_data_validator = VidaForgeWanDataValidator(num_frames=preprocess_config.num_frames)
+        else:
+            raw_data_validator = PreprocessingDataValidator(
+                max_height=preprocess_config.max_height,
+                max_width=preprocess_config.max_width,
+                num_frames=preprocess_config.num_frames,
+                train_fps=preprocess_config.train_fps,
+                speed_factor=preprocess_config.speed_factor,
+                video_length_tolerance_range=preprocess_config.video_length_tolerance_range,
+                drop_short_ratio=preprocess_config.drop_short_ratio,
+            )
         self.add_component("raw_data_validator", raw_data_validator)
 
         # training dataset

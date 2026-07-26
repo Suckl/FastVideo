@@ -264,6 +264,7 @@ torchrun --nproc_per_node=1 \
     --text-encoder-precisions bf16 \
     --preprocess.dataset-type vidaforge \
     --preprocess.dataset-path "/data/VidaForge-3M/meta/shard-00000.parquet" \
+    --preprocess.video-loader-type torchcodec \
     --preprocess.vidaforge-data-root "/data/VidaForge-3M" \
     --preprocess.vidaforge-caption-field caption_level_3 \
     --preprocess.vidaforge-selection auto \
@@ -282,11 +283,12 @@ This producer currently supports Wan text-to-video caches. The frame count
 must be `4n+1`, both spatial dimensions must be divisible by 16,
 `training_cfg_rate` must be zero, and temporal random sampling must be
 disabled. It uses VidaForge's full-clip linspace sampling, prompt cleanup,
-center crop, and fp16 VAE/bf16 UMT5 precisions. CFG dropout remains a per-epoch
-training decision in the Section 2 loader rather than being permanently baked
-into cached text embeddings.
-`drop_short_ratio` must remain `1`, so a clip that cannot provide the requested
-frame count is rejected instead of creating a smaller, mislabeled Wan bucket.
+CUDA beta exact-seek TorchCodec decoding, center crop, and fp16 VAE/bf16 UMT5
+precisions. Torchvision is not accepted for this parity output. CFG dropout
+remains a per-epoch training decision in the Section 2 loader rather than being
+permanently baked into cached text embeddings. As in VidaForge, a clip may be
+at most three decoded frames short; linspace repeats boundary-near samples to
+fill the `4n+1` bucket. Shorter inputs are rejected.
 
 The output contains `provenance.json`, `metadata.json`, metadata shards, and
 one atomic `.meta` file per clip. `provenance.json` records the resolved model
@@ -296,15 +298,18 @@ configuration file. Copy its `vae_fingerprint` and
 Tokenizer files, including `spiece.model`, are included in the text-encoder
 identity because they also affect the resulting embeddings. The same file
 records a `producer_config_fingerprint` over output-affecting settings such as
-resolution, frame count, FPS, caption field, component precision, and tokenizer
-sequence length.
+resolution, frame count, FPS, caption field, selection, manifest content,
+component precision, and tokenizer sequence length. Each item also records a
+fingerprint over its cleaned caption, media bytes, and decoded source metadata.
 
 Interrupted runs do not publish partial `.meta` files. To continue a
 previously published compatible cache, add
 `--preprocess.vidaforge-resume`; FastVideo verifies the model provenance,
-skips completed `clip_id` values before encoding, and atomically publishes a
-new merged metadata generation. Distributed ranks write independent progress
-files and rank zero publishes the merged index after all ranks finish.
+manifest/selection identity, and per-item source fingerprint before retaining a
+completed clip. Changed inputs fail instead of silently reusing stale tensors,
+and the new metadata generation contains only clips seen in the current
+manifest. Distributed ranks write independent progress files and rank zero
+publishes the merged index after all ranks finish.
 
 ```yaml
 training:

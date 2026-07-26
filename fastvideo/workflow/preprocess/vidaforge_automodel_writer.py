@@ -153,6 +153,44 @@ def _safe_child(root: Path, relative_value: object, *, kind: str) -> Path:
     return resolved
 
 
+def build_vidaforge_source_fingerprint(item: dict[str, Any]) -> str:
+    """Bind one cache entry to its cleaned caption, decoded metadata, and media bytes."""
+    from fastvideo.pipelines.preprocess.wan.vidaforge_stages import clean_vidaforge_prompt
+
+    clip_id = str(item.get("clip_id", "")).strip()
+    video = item.get("video")
+    media_source = getattr(video, "source", video)
+    if isinstance(media_source, bytes):
+        media_sha256 = hashlib.sha256(media_source).hexdigest()
+    elif isinstance(media_source, str):
+        media_path = Path(media_source).expanduser().resolve()
+        if not media_path.is_file():
+            raise FileNotFoundError(f"VidaForge producer media path does not exist for {clip_id!r}: {media_path}")
+        media_sha256 = _sha256_file(media_path)
+    else:
+        raise ValueError(f"VidaForge producer cannot fingerprint media for {clip_id!r}")
+
+    resolution = item.get("resolution")
+    if not isinstance(resolution, dict):
+        raise ValueError(f"VidaForge producer input resolution is invalid for {clip_id!r}")
+    identity = {
+        "schema_version": 1,
+        "clip_id": clip_id,
+        "caption": clean_vidaforge_prompt(str(item.get("caption", ""))),
+        "media_sha256": media_sha256,
+        "source_resolution": [
+            int(resolution.get("width", 0)),
+            int(resolution.get("height", 0)),
+        ],
+        "source_fps": float(item.get("fps", 0)),
+        "source_frame_count": int(item.get("num_frames", 0)),
+    }
+    if (not clip_id or not identity["caption"] or min(identity["source_resolution"]) <= 0 or identity["source_fps"] <= 0
+            or identity["source_frame_count"] <= 0):
+        raise ValueError(f"VidaForge producer input identity is incomplete for {clip_id!r}")
+    return hashlib.sha256(_canonical_json(identity)).hexdigest()
+
+
 def _wan_normalize(latents: torch.Tensor, vae: Any) -> torch.Tensor:
     mean_value = getattr(vae, "latents_mean", None)
     std_value = getattr(vae, "latents_std", None)
@@ -245,6 +283,7 @@ class VidaForgeAutoModelWriter:
         self.provenance["producer_config"] = self.producer_config
         self.provenance["producer_config_fingerprint"] = producer_config_fingerprint
         self._existing_items = self._load_existing_items(resume=resume)
+        self._retained_items: dict[str, dict[str, Any]] = {}
         self._new_items: dict[str, dict[str, Any]] = {}
 
     @property
@@ -257,7 +296,15 @@ class VidaForgeAutoModelWriter:
             clip_id = str(item.get("clip_id", "")).strip()
             if not clip_id:
                 raise ValueError("VidaForge producer input is missing clip_id")
-            if clip_id not in self._existing_items and clip_id not in self._new_items:
+            source_fingerprint = build_vidaforge_source_fingerprint(item)
+            item["_vidaforge_source_fingerprint"] = source_fingerprint
+            existing = self._existing_items.get(clip_id)
+            if existing is not None:
+                if existing.get("source_fingerprint") != source_fingerprint:
+                    raise ValueError(
+                        f"Cannot resume VidaForge clip {clip_id!r}: caption, media, or source metadata changed")
+                self._retained_items[clip_id] = existing
+            elif clip_id not in self._new_items:
                 pending.append(item)
         return pending
 
@@ -321,6 +368,13 @@ class VidaForgeAutoModelWriter:
         path = _safe_child(self.output_dir, relative_path, kind="cache file")
         latent_cpu = latents.to(device="cpu", dtype=torch.float16)
         embeddings_cpu = text_embeddings.to(device="cpu", dtype=torch.bfloat16)
+        if not torch.isfinite(latent_cpu).all():
+            raise ValueError(f"VidaForge producer VAE latents must be finite: {clip_id!r}")
+        if not torch.isfinite(embeddings_cpu).all():
+            raise ValueError(f"VidaForge producer text embeddings must be finite: {clip_id!r}")
+        source_fingerprint = str(source.get("source_fingerprint") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", source_fingerprint):
+            raise ValueError(f"VidaForge producer source fingerprint is invalid: {clip_id!r}")
         if caption_token_length <= 0:
             raise ValueError(f"VidaForge producer caption token length must be positive: {clip_id!r}")
         if embeddings_cpu.ndim != 3 or embeddings_cpu.shape[0] != 1:
@@ -342,6 +396,7 @@ class VidaForgeAutoModelWriter:
             "vae_fingerprint": self.provenance["vae_fingerprint"],
             "text_encoder_fingerprint": self.provenance["text_encoder_fingerprint"],
             "producer_config_fingerprint": self.provenance["producer_config_fingerprint"],
+            "source_fingerprint": source_fingerprint,
             "clip_id": clip_id,
             "caption": str(source["caption"]),
             "caption_field": self.producer_config["caption_field"],
@@ -377,18 +432,21 @@ class VidaForgeAutoModelWriter:
             "vae_fingerprint": self.provenance["vae_fingerprint"],
             "text_encoder_fingerprint": self.provenance["text_encoder_fingerprint"],
             "producer_config_fingerprint": self.provenance["producer_config_fingerprint"],
+            "source_fingerprint": source_fingerprint,
         }
 
     def write_rank_progress(self) -> Path:
         path = self.output_dir / ".vidaforge_progress" / f"{self.generation}-rank-{self.rank:05d}.json"
-        _atomic_json(path, list(self._new_items.values()))
+        current_items = dict(self._retained_items)
+        current_items.update(self._new_items)
+        _atomic_json(path, list(current_items.values()))
         return path
 
     def publish(self) -> int:
         """Merge this generation on rank zero and atomically publish metadata.json."""
         if self.rank != 0:
             raise RuntimeError("Only rank zero may publish VidaForge metadata")
-        items_by_clip = dict(self._existing_items)
+        items_by_clip: dict[str, dict[str, Any]] = {}
         progress_dir = self.output_dir / ".vidaforge_progress"
         for rank in range(self.world_size):
             path = progress_dir / f"{self.generation}-rank-{rank:05d}.json"
@@ -491,6 +549,8 @@ class VidaForgeAutoModelWriter:
             raise ValueError(f"Text encoder fingerprint mismatch in {where}")
         if item.get("producer_config_fingerprint") != self.provenance["producer_config_fingerprint"]:
             raise ValueError(f"Producer config fingerprint mismatch in {where}")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(item.get("source_fingerprint", ""))):
+            raise ValueError(f"Source fingerprint is invalid in {where}")
         if validate_payload:
             self._validate_payload(item, cache_path=cache_path, where=where)
 
@@ -513,9 +573,13 @@ class VidaForgeAutoModelWriter:
         if (not isinstance(latents, torch.Tensor) or not latents.is_floating_point() or latents.ndim != 5
                 or tuple(latents.shape) != tuple(item.get("latent_shape", ()))):
             raise ValueError(f"Resumed VidaForge latent shape mismatch: {cache_path}")
+        if latents.dtype != torch.float16 or not torch.isfinite(latents).all():
+            raise ValueError(f"Resumed VidaForge latents must be finite FP16 tensors: {cache_path}")
         if (not isinstance(embeddings, torch.Tensor) or not embeddings.is_floating_point() or embeddings.ndim != 3
                 or embeddings.shape[0] != 1):
             raise ValueError(f"Resumed VidaForge text embeddings are invalid: {cache_path}")
+        if embeddings.dtype != torch.bfloat16 or not torch.isfinite(embeddings).all():
+            raise ValueError(f"Resumed VidaForge text embeddings must be finite BF16 tensors: {cache_path}")
         if not isinstance(metadata, dict):
             raise ValueError(f"Resumed VidaForge metadata is invalid: {cache_path}")
         item_caption_token_length = item.get("caption_token_length")
@@ -541,6 +605,7 @@ class VidaForgeAutoModelWriter:
             "vae_fingerprint": self.provenance["vae_fingerprint"],
             "text_encoder_fingerprint": self.provenance["text_encoder_fingerprint"],
             "producer_config_fingerprint": self.provenance["producer_config_fingerprint"],
+            "source_fingerprint": item["source_fingerprint"],
             "bucket_resolution": item["bucket_resolution"],
             "bucket_frame_count": item["bucket_frame_count"],
         }
@@ -555,4 +620,5 @@ class VidaForgeAutoModelWriter:
 __all__ = [
     "VidaForgeAutoModelWriter",
     "build_model_provenance",
+    "build_vidaforge_source_fingerprint",
 ]
