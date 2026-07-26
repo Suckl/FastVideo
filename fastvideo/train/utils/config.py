@@ -389,6 +389,15 @@ def _build_training_config(
         data=DataConfig(
             data_path=data_path,
             preprocessed_data_type=preprocessed_data_type,
+            vidaforge_model_name=str(da.get("vidaforge_model_name", "") or ""),
+            vidaforge_vae_fingerprint=str(da.get("vidaforge_vae_fingerprint", "") or ""),
+            vidaforge_text_encoder_fingerprint=str(da.get("vidaforge_text_encoder_fingerprint", "") or ""),
+            vidaforge_allow_unverified_model=require_bool(
+                da,
+                "vidaforge_allow_unverified_model",
+                default=False,
+                where="training.data.vidaforge_allow_unverified_model",
+            ),
             train_batch_size=int(da.get("train_batch_size", 1) or 1),
             dataloader_num_workers=int(da.get("dataloader_num_workers", 0) or 0),
             training_cfg_rate=float(da.get("training_cfg_rate", 0.0) or 0.0),

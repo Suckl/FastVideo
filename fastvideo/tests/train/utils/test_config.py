@@ -66,6 +66,10 @@ def test_minimal_yaml_applies_all_defaults(tmp_path: Path) -> None:
     assert t.data.dataloader_num_workers == 0
     assert t.data.training_cfg_rate == 0.0
     assert t.data.seed == 0
+    assert t.data.vidaforge_model_name == ""
+    assert t.data.vidaforge_vae_fingerprint == ""
+    assert t.data.vidaforge_text_encoder_fingerprint == ""
+    assert t.data.vidaforge_allow_unverified_model is False
 
     assert t.optimizer.learning_rate == 0.0
     assert t.optimizer.betas == (0.9, 0.999)
@@ -98,12 +102,47 @@ def test_vidaforge_automodel_data_type_is_accepted(tmp_path: Path) -> None:
         "data": {
             "data_path": "/data/vidaforge-stage5",
             "preprocessed_data_type": "vidaforge_automodel",
+            "vidaforge_model_name":
+            "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            "vidaforge_vae_fingerprint":
+            "a" * 64,
+            "vidaforge_text_encoder_fingerprint":
+            "b" * 64,
+            "vidaforge_allow_unverified_model":
+            True,
         },
     }
 
     cfg = load_run_config(_write_yaml(tmp_path, data))
 
     assert cfg.training.data.preprocessed_data_type == "vidaforge_automodel"
+    assert cfg.training.data.vidaforge_model_name == (
+        "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+    )
+    assert cfg.training.data.vidaforge_vae_fingerprint == "a" * 64
+    assert cfg.training.data.vidaforge_text_encoder_fingerprint == "b" * 64
+    assert cfg.training.data.vidaforge_allow_unverified_model is True
+
+
+@pytest.mark.parametrize("raw_value", ["false", "0", "no", 0, 1])
+def test_vidaforge_unverified_model_opt_in_requires_yaml_bool(
+    tmp_path: Path,
+    raw_value: object,
+) -> None:
+    data = _minimal_yaml()
+    data["training"] = {
+        "data": {
+            "data_path": "/data/vidaforge-stage5",
+            "preprocessed_data_type": "vidaforge_automodel",
+            "vidaforge_allow_unverified_model": raw_value,
+        },
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="training.data.vidaforge_allow_unverified_model must be a bool",
+    ):
+        load_run_config(_write_yaml(tmp_path, data))
 
 
 def test_full_yaml_populates_all_training_fields(tmp_path: Path) -> None:

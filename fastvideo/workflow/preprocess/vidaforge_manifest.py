@@ -15,6 +15,7 @@ import tempfile
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import Enum
+from numbers import Integral
 from pathlib import Path
 from typing import Any
 
@@ -120,10 +121,22 @@ def _detect_manifest_kind(dataset: Dataset, caption_field: str) -> VidaForgeMani
 
 def _status_value(row: dict[str, Any], field: str) -> int:
     clip_id = str(row.get("clip_id") or "<unknown>")
-    try:
-        return int(row[field])
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"VidaForge row {clip_id!r} has invalid {field}: {row.get(field)!r}") from exc
+    raw_value = row.get(field)
+    if isinstance(raw_value, bool) or not isinstance(raw_value, Integral):
+        raise ValueError(f"VidaForge row {clip_id!r} requires integer {field}, "
+                         f"got {raw_value!r}")
+    return int(raw_value)
+
+
+def _clip_id_value(row: dict[str, Any]) -> str:
+    raw_value = row.get("clip_id")
+    if not isinstance(raw_value, str) or not raw_value:
+        raise ValueError(f"VidaForge manifest requires a non-empty string clip_id, "
+                         f"got {raw_value!r}")
+    if raw_value != raw_value.strip():
+        raise ValueError(f"VidaForge clip_id must not have leading or trailing whitespace: "
+                         f"{raw_value!r}")
+    return raw_value
 
 
 def _positive_number(row: dict[str, Any], field: str) -> float:
@@ -173,14 +186,19 @@ def _row_is_eligible(
     manifest_kind: VidaForgeManifestKind,
     selection_value: int | None,
 ) -> bool:
+    _clip_id_value(row)
+    if manifest_kind == VidaForgeManifestKind.RELEASE:
+        return bool(str(row[caption_field] or "").strip())
+
+    clip_ok = _status_value(row, "clip_ok")
+    caption_ok = _status_value(row, "caption_ok")
+    select_ok = _status_value(row, "select_ok")
+    select_pass = _status_value(row, "select_pass")
     if not str(row[caption_field] or "").strip():
         return False
-    if manifest_kind == VidaForgeManifestKind.RELEASE:
-        return True
-    if (_status_value(row, "clip_ok") != 1 or _status_value(row, "caption_ok") != 1
-            or _status_value(row, "select_ok") != 1):
+    if clip_ok != 1 or caption_ok != 1 or select_ok != 1:
         return False
-    return selection_value is None or _status_value(row, "select_pass") == selection_value
+    return selection_value is None or select_pass == selection_value
 
 
 def _safe_relative_path(root: Path, raw_path: Any, *, field: str, clip_id: str) -> Path:
@@ -238,7 +256,7 @@ def _validate_release_clip(path: Path, *, expected_size: int, expected_sha256: s
 
 
 def _release_storage_values(row: dict[str, Any]) -> tuple[str, int, int, str]:
-    clip_id = str(row.get("clip_id") or "").strip()
+    clip_id = _clip_id_value(row)
     expected_size = _integer_value(row, "filesize_bytes", minimum=1)
     tar_offset = _integer_value(row, "tar_offset", minimum=0)
     expected_sha256 = str(row.get("sha256") or "").strip().lower()
@@ -416,6 +434,12 @@ def _probe_video(source: str | bytes, *, clip_id: str, fallback_fps: float) -> d
     }
 
 
+def _safe_sample_name(clip_id: str) -> str:
+    """Return one collision-resistant, portable output key per clip ID."""
+    digest = hashlib.sha256(clip_id.encode("utf-8")).hexdigest()
+    return f"vidaforge-{digest}"
+
+
 def _normalize_row(
     row: dict[str, Any],
     *,
@@ -425,9 +449,7 @@ def _normalize_row(
     materialize_root: Path | None,
     video_loader_type: VideoLoaderType,
 ) -> dict[str, Any]:
-    clip_id = str(row["clip_id"] or "").strip()
-    if not clip_id:
-        raise ValueError("VidaForge manifest contains an empty clip_id")
+    clip_id = _clip_id_value(row)
 
     _positive_number(row, "width")
     _positive_number(row, "height")
@@ -459,7 +481,7 @@ def _normalize_row(
     media = _probe_video(media_source, clip_id=clip_id, fallback_fps=manifest_fps)
     return {
         "video": video,
-        "name": clip_id,
+        "name": _safe_sample_name(clip_id),
         "resolution": {
             "width": media["width"],
             "height": media["height"],

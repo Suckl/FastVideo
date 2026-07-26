@@ -184,9 +184,10 @@ class WanModel(ModelBase):
         self._input_latents_are_normalized = (preprocessed_data_type == "vidaforge_automodel")
         parquet_schema = pyarrow_schema_t2v
         if self._input_latents_are_normalized:
+            expected_model_name = (training_config.data.vidaforge_model_name or str(training_config.model_path))
             self.dataloader = build_vidaforge_automodel_train_dataloader(
                 training_config.data,
-                expected_model_name=str(training_config.model_path),
+                expected_model_name=expected_model_name,
             )
         elif preprocessed_data_type == "text_only":
             parquet_schema = pyarrow_schema_text_only

@@ -147,6 +147,7 @@ def test_official_wan_automodel_payload_loads_without_conversion(
     loaded = VidaForgeAutoModelDataset(
         cache_dir,
         expected_model_name="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        allow_unverified_model=True,
     )[0]
 
     assert loaded["vae_latent"].dtype == torch.float16

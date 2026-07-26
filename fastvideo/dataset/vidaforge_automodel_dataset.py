@@ -43,6 +43,9 @@ class VidaForgeAutoModelDataset(Dataset[dict[str, Any]]):
         cfg_rate: float = 0.0,
         seed: int = 0,
         expected_model_name: str | Path | None = None,
+        expected_vae_fingerprint: str | None = None,
+        expected_text_encoder_fingerprint: str | None = None,
+        allow_unverified_model: bool = False,
     ) -> None:
         super().__init__()
         if not 0.0 <= cfg_rate <= 1.0:
@@ -56,6 +59,11 @@ class VidaForgeAutoModelDataset(Dataset[dict[str, Any]]):
             if expected_model_name is None
             else str(expected_model_name).strip()
         )
+        self.expected_vae_fingerprint = expected_vae_fingerprint
+        self.expected_text_encoder_fingerprint = (
+            expected_text_encoder_fingerprint
+        )
+        self.allow_unverified_model = bool(allow_unverified_model)
         self.metadata = self._read_metadata()
         if not self.metadata:
             raise ValueError(
@@ -74,8 +82,12 @@ class VidaForgeAutoModelDataset(Dataset[dict[str, Any]]):
     def __len__(self) -> int:
         return len(self.metadata)
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        item = self.metadata[index]
+    def __getitem__(
+        self,
+        index: int | tuple[int, int],
+    ) -> dict[str, Any]:
+        sample_index, _epoch = _split_sample_index(index)
+        item = self.metadata[sample_index]
         path = self._resolve_cache_path(item)
         payload = torch.load(path, map_location="cpu", weights_only=True)
         if not isinstance(payload, dict):
@@ -116,21 +128,19 @@ class VidaForgeAutoModelDataset(Dataset[dict[str, Any]]):
             raise ValueError(
                 f"VidaForge Wan .meta is missing metadata.model_name: {path}"
             )
-        if (
-            self.expected_model_name
-            and not _model_names_compatible(
-                model_name,
-                self.expected_model_name,
-            )
-        ):
+        if self.expected_model_name and model_name != self.expected_model_name:
             raise ValueError(
                 "VidaForge cache model_name does not match the FastVideo "
                 "checkpoint: "
                 f"cache={model_name!r}, "
-                f"checkpoint={self.expected_model_name!r}, path={path}"
+                f"expected={self.expected_model_name!r}, path={path}. "
+                "For a local checkpoint, set "
+                "training.data.vidaforge_model_name to the canonical "
+                "producer model name."
             )
+        self._validate_model_provenance(metadata, path=path)
 
-        key = self._bucket_keys[index]
+        key = self._bucket_keys[sample_index]
         actual_latent_shape = tuple(int(value) for value in video_latents.shape)
         if actual_latent_shape != key[3]:
             raise ValueError(
@@ -176,15 +186,30 @@ class VidaForgeAutoModelDataset(Dataset[dict[str, Any]]):
             },
         }
 
-    def __getitems__(self, indices: list[int]) -> dict[str, Any]:
+    def __getitems__(
+        self,
+        indices: list[int | tuple[int, int]],
+    ) -> dict[str, Any]:
+        split_indices = [_split_sample_index(index) for index in indices]
+        sample_indices = [index for index, _epoch in split_indices]
+        epochs = {epoch for _index, epoch in split_indices}
+        if len(epochs) != 1:
+            raise ValueError(
+                f"VidaForge batch mixes sampler epochs: {sorted(epochs)}"
+            )
         samples = [self[index] for index in indices]
-        return self.collate(samples, indices=indices)
+        return self.collate(
+            samples,
+            indices=sample_indices,
+            epoch=epochs.pop(),
+        )
 
     def collate(
         self,
         samples: list[dict[str, Any]],
         *,
         indices: list[int],
+        epoch: int = 0,
     ) -> dict[str, Any]:
         if not samples:
             raise ValueError("Cannot collate an empty VidaForge batch")
@@ -203,7 +228,10 @@ class VidaForgeAutoModelDataset(Dataset[dict[str, Any]]):
         if self.cfg_rate > 0:
             embeddings = embeddings.clone()
             for batch_index, sample_index in enumerate(indices):
-                if random.Random(self.seed ^ sample_index).random() < self.cfg_rate:
+                cfg_seed = self.seed ^ sample_index ^ (
+                    epoch * 0x9E3779B1
+                )
+                if random.Random(cfg_seed).random() < self.cfg_rate:
                     embeddings[batch_index].zero_()
 
         return {
@@ -272,6 +300,75 @@ class VidaForgeAutoModelDataset(Dataset[dict[str, Any]]):
                 items.append(item)
         return items
 
+    def _validate_model_provenance(
+        self,
+        metadata: dict[str, Any],
+        *,
+        path: Path,
+    ) -> None:
+        actual_vae = str(metadata.get("vae_fingerprint", "") or "").lower()
+        actual_text = str(
+            metadata.get("text_encoder_fingerprint", "") or "",
+        ).lower()
+        expected_vae = str(self.expected_vae_fingerprint or "").lower()
+        expected_text = str(
+            self.expected_text_encoder_fingerprint or "",
+        ).lower()
+
+        if bool(actual_vae) != bool(actual_text):
+            raise ValueError(
+                "VidaForge model provenance must contain both "
+                f"vae_fingerprint and text_encoder_fingerprint: {path}"
+            )
+        if actual_vae:
+            _require_sha256(actual_vae, field="vae_fingerprint", path=path)
+            _require_sha256(
+                actual_text,
+                field="text_encoder_fingerprint",
+                path=path,
+            )
+
+        if bool(expected_vae) != bool(expected_text):
+            raise ValueError(
+                "FastVideo requires both vidaforge_vae_fingerprint and "
+                "vidaforge_text_encoder_fingerprint when either is set"
+            )
+        if expected_vae:
+            _require_sha256(
+                expected_vae,
+                field="expected vae fingerprint",
+                path=path,
+            )
+            _require_sha256(
+                expected_text,
+                field="expected text encoder fingerprint",
+                path=path,
+            )
+            if not actual_vae:
+                raise ValueError(
+                    "VidaForge cache does not record VAE/text encoder "
+                    f"fingerprints required by the training config: {path}"
+                )
+            if (
+                actual_vae != expected_vae
+                or actual_text != expected_text
+            ):
+                raise ValueError(
+                    "VidaForge component fingerprint mismatch: "
+                    f"path={path}, vae={actual_vae!r}, "
+                    f"text_encoder={actual_text!r}"
+                )
+            return
+
+        if not self.allow_unverified_model:
+            raise ValueError(
+                "VidaForge Stage 5 cache has no verifiable component "
+                "identity. Provide training.data.vidaforge_vae_fingerprint "
+                "and vidaforge_text_encoder_fingerprint, or explicitly set "
+                "vidaforge_allow_unverified_model=true for a legacy cache. "
+                f"Unverified cache: {path}"
+            )
+
     def _resolve_cache_path(self, item: dict[str, Any]) -> Path:
         cache_file_text = str(item["cache_file"])
         cache_file = Path(cache_file_text).expanduser()
@@ -315,7 +412,7 @@ class VidaForgeAutoModelDataset(Dataset[dict[str, Any]]):
         raise FileNotFoundError(f"Missing VidaForge .meta cache file: {path}")
 
 
-class VidaForgeBucketBatchSampler(Sampler[list[int]]):
+class VidaForgeBucketBatchSampler(Sampler[list[tuple[int, int]]]):
     """Bucket sampler aligned over data-parallel groups and SP replicas."""
 
     def __init__(
@@ -367,7 +464,7 @@ class VidaForgeBucketBatchSampler(Sampler[list[int]]):
                 f"drop_last={self.drop_last}, bucket_sizes={bucket_sizes}"
             )
 
-    def __iter__(self) -> Iterator[list[int]]:
+    def __iter__(self) -> Iterator[list[tuple[int, int]]]:
         generator = torch.Generator().manual_seed(self.seed + self.epoch)
         bucket_keys = list(self.dataset.sorted_bucket_keys)
         if self.shuffle:
@@ -393,7 +490,10 @@ class VidaForgeBucketBatchSampler(Sampler[list[int]]):
                     raise RuntimeError(
                         "Internal VidaForge sampler error: incomplete rank batch"
                     )
-                yield batch
+                yield [
+                    (sample_index, self.epoch)
+                    for sample_index in batch
+                ]
 
     def __len__(self) -> int:
         return self._length
@@ -416,6 +516,62 @@ class VidaForgeBucketBatchSampler(Sampler[list[int]]):
         ]
 
 
+class EpochStatefulDataLoader:
+    """Advance bucket shuffle epochs while preserving exact resume state."""
+
+    def __init__(
+        self,
+        loader: StatefulDataLoader,
+        sampler: VidaForgeBucketBatchSampler,
+    ) -> None:
+        self._loader = loader
+        self._sampler = sampler
+        self._epoch = 0
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        self._sampler.set_epoch(self._epoch)
+        iterator = iter(self._loader)
+        completed = False
+        try:
+            while True:
+                try:
+                    yield next(iterator)
+                except StopIteration:
+                    completed = True
+                    return
+        finally:
+            if completed:
+                self._epoch += 1
+
+    def __len__(self) -> int:
+        return len(self._loader)
+
+    @property
+    def dataset(self) -> Any:
+        return self._loader.dataset
+
+    @property
+    def batch_sampler(self) -> VidaForgeBucketBatchSampler:
+        return self._sampler
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "epoch": self._epoch,
+            "loader": self._loader.state_dict(),
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        epoch = int(state_dict["epoch"])
+        if epoch < 0:
+            raise ValueError(f"VidaForge dataloader epoch must be >= 0: {epoch}")
+        loader_state = state_dict["loader"]
+        if not isinstance(loader_state, dict):
+            raise TypeError("VidaForge dataloader loader state must be a dict")
+        self._epoch = epoch
+        self._sampler.set_epoch(epoch)
+        self._loader.load_state_dict(loader_state)
+
+
 def build_vidaforge_automodel_dataloader(
     path: str | Path,
     batch_size: int,
@@ -424,12 +580,20 @@ def build_vidaforge_automodel_dataloader(
     cfg_rate: float = 0.0,
     seed: int = 0,
     expected_model_name: str | Path | None = None,
-) -> tuple[VidaForgeAutoModelDataset, StatefulDataLoader]:
+    expected_vae_fingerprint: str | None = None,
+    expected_text_encoder_fingerprint: str | None = None,
+    allow_unverified_model: bool = False,
+) -> tuple[VidaForgeAutoModelDataset, EpochStatefulDataLoader]:
     dataset = VidaForgeAutoModelDataset(
         path,
         cfg_rate=cfg_rate,
         seed=seed,
         expected_model_name=expected_model_name,
+        expected_vae_fingerprint=expected_vae_fingerprint,
+        expected_text_encoder_fingerprint=(
+            expected_text_encoder_fingerprint
+        ),
+        allow_unverified_model=allow_unverified_model,
     )
     sampler = VidaForgeBucketBatchSampler(
         dataset,
@@ -438,7 +602,7 @@ def build_vidaforge_automodel_dataloader(
         shuffle=True,
         seed=seed,
     )
-    loader = StatefulDataLoader(
+    stateful_loader = StatefulDataLoader(
         dataset,
         batch_sampler=sampler,
         collate_fn=_passthrough,
@@ -446,6 +610,7 @@ def build_vidaforge_automodel_dataloader(
         pin_memory=True,
         persistent_workers=num_data_workers > 0,
     )
+    loader = EpochStatefulDataLoader(stateful_loader, sampler)
     return dataset, loader
 
 
@@ -560,46 +725,34 @@ def _cat_same_shape(
     return torch.cat(tensors, dim=0)
 
 
-def _model_names_compatible(
-    cache_model_name: str,
-    checkpoint: str,
-) -> bool:
-    cache_identity = _normalize_model_identity(cache_model_name)
-    checkpoint_identity = _normalize_model_identity(checkpoint)
-    if cache_identity == checkpoint_identity:
-        return True
+def _split_sample_index(
+    value: int | tuple[int, int],
+) -> tuple[int, int]:
+    if isinstance(value, tuple):
+        if len(value) != 2:
+            raise ValueError(f"Invalid VidaForge sampler index: {value!r}")
+        sample_index, epoch = int(value[0]), int(value[1])
+    else:
+        sample_index, epoch = int(value), 0
+    if epoch < 0:
+        raise ValueError(f"VidaForge sampler epoch must be >= 0: {epoch}")
+    return sample_index, epoch
 
-    # Hugging Face snapshots commonly look like
-    # ".../models--Wan-AI--Wan2.1-.../snapshots/<revision>".
-    for part in checkpoint.replace("\\", "/").split("/"):
-        if part.startswith("models--"):
-            hub_identity = _normalize_model_identity(
-                part[len("models--"):].replace("--", "/"),
-            )
-            if hub_identity == cache_identity:
-                return True
 
-    checkpoint_path = Path(checkpoint).expanduser()
-    checkpoint_is_local = (
-        checkpoint_path.exists()
-        or PurePosixPath(checkpoint).is_absolute()
-        or PureWindowsPath(checkpoint).is_absolute()
-        or checkpoint.startswith(("./", "../", ".\\", "..\\", "~"))
-    )
-    if checkpoint_is_local:
-        return (
-            cache_identity.rsplit("/", 1)[-1]
-            == checkpoint_identity.rsplit("/", 1)[-1]
+def _require_sha256(value: str, *, field: str, path: Path) -> None:
+    if len(value) != 64 or any(
+        character not in "0123456789abcdef"
+        for character in value
+    ):
+        raise ValueError(
+            f"{field} must be a lowercase SHA-256 digest: "
+            f"path={path}, value={value!r}"
         )
-    return False
-
-
-def _normalize_model_identity(value: str) -> str:
-    return value.strip().replace("\\", "/").rstrip("/").lower()
 
 
 __all__ = [
     "VidaForgeAutoModelDataset",
     "VidaForgeBucketBatchSampler",
+    "EpochStatefulDataLoader",
     "build_vidaforge_automodel_dataloader",
 ]

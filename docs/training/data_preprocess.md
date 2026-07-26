@@ -205,6 +205,14 @@ Stage 4 rows with `clip_ok != 1`, `caption_ok != 1`, `select_ok != 1`, or an
 empty selected caption are excluded. Checking `select_ok` prevents selection
 worker failures from being treated as ordinary rejected clips.
 
+FastVideo treats `clip_id` as data, not as an output path. Every ID is
+deterministically encoded as `vidaforge-<sha256>` before processed artifacts
+are written. Using one mapping for all IDs avoids extension, case-folding, and
+reserved-name collisions across platforms. Empty IDs and IDs with leading or
+trailing whitespace are rejected instead of normalized, so uniqueness checks
+and output hashing use identical input. Output savers also verify that every
+resolved path remains under its configured output directory.
+
 FastVideo probes each selected MP4 for its container-indexed width, height,
 FPS, and frame count, decoding to count frames when the container omits that
 count. It does not derive frame count from `fps * duration_sec`, because
@@ -245,6 +253,9 @@ training:
   data:
     data_path: /data/vidaforge-stage5
     preprocessed_data_type: vidaforge_automodel
+    vidaforge_model_name: Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+    vidaforge_vae_fingerprint: <64-character-sha256>
+    vidaforge_text_encoder_fingerprint: <64-character-sha256>
     train_batch_size: 1
     dataloader_num_workers: 4
     training_cfg_rate: 0.0
@@ -266,24 +277,50 @@ normalization. FastVideo marks this data type explicitly and does not normalize
 those latents a second time. Regular FastVideo `t2v` Parquet inputs retain the
 existing runtime normalization.
 
-The Stage 5 cache must use `model_type: wan`. FastVideo validates its
-`model_name` against the Wan checkpoint selected by the training config before
-using a sample. HF repo IDs, same-named local model directories, and standard
-HF snapshot cache paths are recognized. FastVideo derives the attention mask
-from `text_mask` when present, or from
-`caption_token_length` for the standard VidaForge Wan payload. Moving a complete
-Stage 5 output tree is supported even though VidaForge records absolute
-`cache_file` paths; FastVideo rebases missing paths from the bucket directory
-suffix. Metadata-only split directories may continue to reference an existing
-absolute cache tree.
+The Stage 5 cache must use `model_type: wan`. FastVideo compares `model_name`
+exactly with `vidaforge_model_name`, or with `training.model_path` when the
+explicit name is omitted. Set `vidaforge_model_name` when training from a local
+checkpoint path. FastVideo does not infer model identity from a local directory
+basename or a Hugging Face snapshot path.
+
+Verified caches must record both `vae_fingerprint` and
+`text_encoder_fingerprint` in each payload's `metadata`. Each value is the
+lowercase SHA-256 of a canonical component manifest that includes the immutable
+model revision, component configuration, and the path and SHA-256 of every
+weight file. Configure the two expected fingerprints above; FastVideo compares
+them exactly before using the already-encoded tensors. A future FastVideo
+Stage 5 producer should create these manifests and write the resulting
+fingerprints alongside every cache payload.
+
+VidaForge revision `4562d3f` does not yet write component fingerprints. To use
+one of those legacy caches, opt into name-and-shape validation explicitly:
+
+```yaml
+training:
+  data:
+    preprocessed_data_type: vidaforge_automodel
+    vidaforge_model_name: Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+    vidaforge_allow_unverified_model: true
+```
+
+This compatibility switch cannot prove which VAE or text encoder produced the
+cache. Keep it disabled for newly produced data. FastVideo derives the
+attention mask from `text_mask` when present, or from `caption_token_length`
+for the standard VidaForge Wan payload. Moving a complete Stage 5 output tree
+is supported even though VidaForge records absolute `cache_file` paths;
+FastVideo rebases missing paths from the bucket directory suffix. Metadata-only
+split directories may continue to reference an existing absolute cache tree.
 
 With `drop_last: true` training semantics, every bucket needs at least
 `train_batch_size * data_parallel_group_count` samples. The loader fails early
 with bucket sizes when no complete distributed batch can be formed.
 
-The opt-in GPU smoke test runs the pinned VidaForge Wan encoder on one real
+The opt-in GPU smoke test runs the pinned VidaForge repository revision and Wan
+model ID on one real
 HEVC clip from VidaForge-3M, writes the official Stage 5 payload, and checks
-that FastVideo loads its tensors bit-exactly:
+that FastVideo loads its tensors bit-exactly. Because that VidaForge revision
+does not emit component fingerprints, this test exercises the explicit legacy
+compatibility path; it is not a cryptographic model-provenance test:
 
 ```bash
 git clone https://github.com/GAIR-NLP/VidaForge /tmp/VidaForge

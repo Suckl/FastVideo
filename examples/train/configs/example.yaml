@@ -91,6 +91,10 @@ training:
   data:
     data_path: data/my_dataset        # default: ""
     preprocessed_data_type: t2v       # "t2v", "text_only", or "vidaforge_automodel" (Wan Stage 5 cache)
+    vidaforge_model_name: ""          # exact producer model name; useful when model_path is local
+    vidaforge_vae_fingerprint: ""      # producer VAE SHA-256 identity; required for verified Stage 5 cache
+    vidaforge_text_encoder_fingerprint: ""  # producer text encoder SHA-256 identity; required with VAE identity
+    vidaforge_allow_unverified_model: false # legacy cache only; cannot verify its VAE/text encoder
     train_batch_size: 1               # default: 1
     dataloader_num_workers: 4         # default: 0
     training_cfg_rate: 0.1            # default: 0.0

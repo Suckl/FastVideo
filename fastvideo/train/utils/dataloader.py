@@ -75,5 +75,8 @@ def build_vidaforge_automodel_train_dataloader(
         cfg_rate=data_config.training_cfg_rate,
         seed=int(data_config.seed or 0),
         expected_model_name=expected_model_name,
+        expected_vae_fingerprint=(data_config.vidaforge_vae_fingerprint or None),
+        expected_text_encoder_fingerprint=(data_config.vidaforge_text_encoder_fingerprint or None),
+        allow_unverified_model=(data_config.vidaforge_allow_unverified_model),
     )
     return dataloader

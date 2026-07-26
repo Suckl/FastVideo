@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING
 
 import torch
@@ -36,7 +36,25 @@ class LTX2PrecomputedSaver:
         self.conditions_dir.mkdir(parents=True, exist_ok=True)
 
     def _to_rel_pt_path(self, video_name: str) -> Path:
-        return Path(video_name).with_suffix(".pt")
+        raw_path = str(video_name).strip()
+        if not raw_path:
+            raise ValueError("LTX-2 sample name must not be empty")
+        posix_path = PurePosixPath(raw_path)
+        windows_path = PureWindowsPath(raw_path)
+        if (posix_path.is_absolute() or windows_path.is_absolute() or windows_path.drive):
+            raise ValueError(f"LTX-2 sample name must be relative: {video_name!r}")
+        if ".." in posix_path.parts or ".." in windows_path.parts:
+            raise ValueError(f"LTX-2 sample name must not traverse directories: "
+                             f"{video_name!r}")
+        return Path(raw_path).with_suffix(".pt")
+
+    @staticmethod
+    def _contained_output_path(root: Path, rel_path: Path) -> Path:
+        resolved_root = root.resolve()
+        output_path = (resolved_root / rel_path).resolve()
+        if not output_path.is_relative_to(resolved_root):
+            raise ValueError(f"LTX-2 output path escapes {resolved_root}: {rel_path}")
+        return output_path
 
     def save_batch(self, batch: PreprocessBatch) -> None:
         assert isinstance(batch.latents, torch.Tensor)
@@ -58,7 +76,10 @@ class LTX2PrecomputedSaver:
         for idx, video_name in enumerate(batch.video_file_name):
             rel_path = self._to_rel_pt_path(video_name)
 
-            latent_output = self.latents_dir / rel_path
+            latent_output = self._contained_output_path(
+                self.latents_dir,
+                rel_path,
+            )
             latent_output.parent.mkdir(parents=True, exist_ok=True)
             latent = batch.latents[idx].detach().cpu().contiguous()
             latent_payload = {
@@ -70,7 +91,10 @@ class LTX2PrecomputedSaver:
             }
             torch.save(latent_payload, latent_output)
 
-            condition_output = self.conditions_dir / rel_path
+            condition_output = self._contained_output_path(
+                self.conditions_dir,
+                rel_path,
+            )
             condition_output.parent.mkdir(parents=True, exist_ok=True)
             condition_payload = {
                 "prompt_embeds": prompt_embeds[idx].detach().cpu().contiguous(),
@@ -87,7 +111,10 @@ class LTX2PrecomputedSaver:
             assert self.audio_latents_dir is not None
 
             audio_latent = audio_latents[idx].detach().cpu().contiguous()
-            audio_output = self.audio_latents_dir / rel_path
+            audio_output = self._contained_output_path(
+                self.audio_latents_dir,
+                rel_path,
+            )
             audio_output.parent.mkdir(parents=True, exist_ok=True)
             audio_payload = {
                 "latents": audio_latent,

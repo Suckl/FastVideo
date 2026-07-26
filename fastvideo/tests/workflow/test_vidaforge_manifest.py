@@ -31,6 +31,10 @@ _VIDAFORGE_RELEASE_REVISION = "091bdc02d82b8c89a4e4eff54945d286fb328b47"
 _VIDAFORGE_HEVC_SMOKE_CLIP_ID = "video-9a2221ec0d47d85c:clip:00002:02"
 
 
+def _sample_name(clip_id: str) -> str:
+    return "vidaforge-" + hashlib.sha256(clip_id.encode("utf-8")).hexdigest()
+
+
 def _identity_collate(batch):
     return batch
 
@@ -230,7 +234,7 @@ def test_build_vidaforge_dataset_normalizes_relative_clip_path(tmp_path: Path):
 
     assert list(dataset) == [{
         "video": str(expected_video_path.resolve()),
-        "name": "clip-a",
+        "name": _sample_name("clip-a"),
         "resolution": {
             "width": 32,
             "height": 24,
@@ -281,7 +285,175 @@ def test_build_vidaforge_dataset_filters_status_and_empty_caption(tmp_path: Path
 
     dataset = build_dataset(_config(manifest_path, data_root=data_root), split="train", validator=lambda row: True)
 
-    assert [row["name"] for row in dataset] == ["keep"]
+    assert [row["name"] for row in dataset] == [_sample_name("keep")]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("clip_ok", 1.9),
+        ("caption_ok", 1.5),
+        ("select_ok", float("nan")),
+        ("select_pass", float("inf")),
+        ("clip_ok", "1"),
+        ("caption_ok", True),
+        ("select_ok", 1.0),
+    ],
+)
+def test_build_vidaforge_dataset_rejects_non_integer_status(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    row = _row(
+        clip_id="invalid-status",
+        clip_path="data/clip.mp4",
+    )
+    row[field] = value
+    manifest_path = tmp_path / "clip-00000.parquet"
+    _write_parquet(manifest_path, [row])
+
+    with pytest.raises(ValueError, match=rf"requires integer {field}"):
+        build_dataset(
+            _config(manifest_path, data_root=tmp_path),
+            split="train",
+            validator=lambda sample: True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "selection", "invalid_field"),
+    [
+        ({"clip_ok": 0, "caption_ok": 1.5}, "auto", "caption_ok"),
+        ({"select_pass": 1.5}, "all", "select_pass"),
+        (
+            {
+                "caption_level_3": "",
+                "select_ok": 1.5,
+            },
+            "auto",
+            "select_ok",
+        ),
+    ],
+)
+def test_build_vidaforge_dataset_validates_all_statuses_before_filtering(
+    tmp_path: Path,
+    overrides: dict[str, object],
+    selection: str,
+    invalid_field: str,
+) -> None:
+    row = _row(
+        clip_id="invalid-short-circuit-status",
+        clip_path="data/clip.mp4",
+    )
+    row.update(overrides)
+    manifest_path = tmp_path / "clip-00000.parquet"
+    _write_parquet(manifest_path, [row])
+
+    with pytest.raises(
+        ValueError,
+        match=rf"requires integer {invalid_field}",
+    ):
+        build_dataset(
+            _config(
+                manifest_path,
+                data_root=tmp_path,
+                vidaforge_selection=selection,
+            ),
+            split="train",
+            validator=lambda sample: True,
+        )
+
+
+@pytest.mark.parametrize(
+    "clip_id",
+    [
+        "../../target",
+        "/absolute/target",
+        r"C:\absolute\target",
+        _VIDAFORGE_HEVC_SMOKE_CLIP_ID,
+        "CON",
+        "trailing-dot.",
+    ],
+)
+def test_build_vidaforge_dataset_encodes_unsafe_clip_id(
+    tmp_path: Path,
+    clip_id: str,
+) -> None:
+    video_path = _video_path(tmp_path, "clip.mp4").resolve()
+    manifest_path = tmp_path / "clip-00000.parquet"
+    _write_parquet(
+        manifest_path,
+        [_row(clip_id=clip_id, clip_path=str(video_path))],
+    )
+
+    dataset = build_dataset(
+        _config(manifest_path),
+        split="train",
+        validator=lambda sample: True,
+    )
+    sample_name = next(iter(dataset))["name"]
+
+    assert sample_name == _sample_name(clip_id)
+    assert "/" not in sample_name
+    assert "\\" not in sample_name
+    assert ":" not in sample_name
+
+
+def test_build_vidaforge_dataset_output_names_do_not_fold_extensions_or_case(
+    tmp_path: Path,
+) -> None:
+    video_path = _video_path(tmp_path, "clip.mp4").resolve()
+    collision_target = "collision-target"
+    clip_ids = [
+        "foo.mp4",
+        "foo.webm",
+        "clip",
+        "CLIP",
+        collision_target,
+        _sample_name(collision_target),
+    ]
+    manifest_path = tmp_path / "clip-00000.parquet"
+    _write_parquet(
+        manifest_path,
+        [
+            _row(clip_id=clip_id, clip_path=str(video_path))
+            for clip_id in clip_ids
+        ],
+    )
+
+    dataset = build_dataset(
+        _config(manifest_path),
+        split="train",
+        validator=lambda sample: True,
+    )
+    sample_names = [row["name"] for row in dataset]
+
+    assert sample_names == [_sample_name(clip_id) for clip_id in clip_ids]
+    assert len(set(sample_names)) == len(clip_ids)
+    assert len({name.casefold() for name in sample_names}) == len(clip_ids)
+
+
+@pytest.mark.parametrize("clip_id", [" clip", "clip ", "\tclip", "clip\n"])
+def test_build_vidaforge_dataset_rejects_clip_id_whitespace(
+    tmp_path: Path,
+    clip_id: str,
+) -> None:
+    manifest_path = tmp_path / "clip-00000.parquet"
+    _write_parquet(
+        manifest_path,
+        [_row(clip_id=clip_id, clip_path="data/clip.mp4")],
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="leading or trailing whitespace",
+    ):
+        build_dataset(
+            _config(manifest_path, data_root=tmp_path),
+            split="train",
+            validator=lambda sample: True,
+        )
 
 
 def test_build_vidaforge_dataset_rejects_manifest_without_eligible_rows(tmp_path: Path):
@@ -334,7 +506,9 @@ def test_build_vidaforge_dataset_selection_modes(
         validator=lambda row: True,
     )
 
-    assert [row["name"] for row in dataset] == expected_names
+    assert [row["name"] for row in dataset] == [
+        _sample_name(clip_id) for clip_id in expected_names
+    ]
 
 
 def test_build_vidaforge_dataset_uses_configured_caption_field(tmp_path: Path):
@@ -365,7 +539,10 @@ def test_build_vidaforge_dataset_reads_only_direct_parquet_shards(tmp_path: Path
 
     dataset = build_dataset(_config(manifest_dir, data_root=data_root), split="train", validator=lambda row: True)
 
-    assert [row["name"] for row in dataset] == ["clip-0", "clip-1"]
+    assert [row["name"] for row in dataset] == [
+        _sample_name("clip-0"),
+        _sample_name("clip-1"),
+    ]
 
 
 def test_build_vidaforge_dataset_rejects_missing_required_columns(tmp_path: Path):
@@ -455,7 +632,7 @@ def test_build_vidaforge_stage4_defers_media_probe_until_iteration(tmp_path: Pat
     dataset = build_dataset(_config(manifest_path), split="train", validator=_keep_all)
 
     probe_spy.assert_not_called()
-    assert next(iter(dataset))["name"] == "clip-a"
+    assert next(iter(dataset))["name"] == _sample_name("clip-a")
     probe_spy.assert_called_once()
 
 
@@ -511,7 +688,7 @@ def test_build_vidaforge_release_materializes_indexed_tar_clip(tmp_path: Path):
     assert materialized_path.read_bytes() == source_video.read_bytes()
     assert materialized_path.parent == materialize_dir.resolve() / sha256[:2]
     assert materialized_path.name == f"{sha256}.mp4"
-    assert rows[0]["name"] == "release-clip"
+    assert rows[0]["name"] == _sample_name("release-clip")
     assert rows[0]["resolution"] == {
         "width": 40,
         "height": 30,
@@ -836,8 +1013,14 @@ def test_vidaforge_metadata_is_filtered_and_validated_globally_before_rank_shard
     assert checked_lengths == [("clip_id", 4)]
     assert "unused_large_column" not in rank_zero_dataset.metadata.column_names
     assert "unused_large_column" not in rank_one_dataset.metadata.column_names
-    assert [row["name"] for row in rank_zero_dataset] == ["clip-0", "clip-1"]
-    assert [row["name"] for row in rank_one_dataset] == ["clip-2", "clip-3"]
+    assert [row["name"] for row in rank_zero_dataset] == [
+        _sample_name("clip-0"),
+        _sample_name("clip-1"),
+    ]
+    assert [row["name"] for row in rank_one_dataset] == [
+        _sample_name("clip-2"),
+        _sample_name("clip-3"),
+    ]
 
 
 def test_vidaforge_global_filter_balances_eligible_rows_across_ranks(tmp_path: Path, monkeypatch):
@@ -871,8 +1054,12 @@ def test_vidaforge_global_filter_balances_eligible_rows_across_ranks(tmp_path: P
     current_rank["value"] = 1
     rank_one_dataset = build_dataset(config, split="train", validator=_keep_all)
 
-    assert [row["name"] for row in rank_zero_dataset] == ["clip-2"]
-    assert [row["name"] for row in rank_one_dataset] == ["clip-3"]
+    assert [row["name"] for row in rank_zero_dataset] == [
+        _sample_name("clip-2")
+    ]
+    assert [row["name"] for row in rank_one_dataset] == [
+        _sample_name("clip-3")
+    ]
 
 
 def test_vidaforge_global_unique_check_catches_duplicate_across_rank_boundary(tmp_path: Path, monkeypatch):
@@ -927,7 +1114,10 @@ def test_build_vidaforge_release_shards_rows_across_dataloader_workers(tmp_path:
         validator=lambda row: True,
     )
 
-    assert [row["name"] for row in dataset] == ["release-2", "release-3"]
+    assert [row["name"] for row in dataset] == [
+        _sample_name("release-2"),
+        _sample_name("release-3"),
+    ]
 
 
 def test_vidaforge_workflow_rejects_all_rows_dropped_by_dataloader_workers(tmp_path: Path):
@@ -1030,10 +1220,10 @@ def test_build_vidaforge_dataset_applies_fastvideo_validator(tmp_path: Path):
     dataset = build_dataset(
         _config(manifest_path, data_root=data_root),
         split="train",
-        validator=lambda row: row["name"] == "keep",
+        validator=lambda row: row["name"] == _sample_name("keep"),
     )
 
-    assert [row["name"] for row in dataset] == ["keep"]
+    assert [row["name"] for row in dataset] == [_sample_name("keep")]
 
 
 def test_normalized_vidaforge_row_builds_preprocess_batch(tmp_path: Path):
@@ -1045,7 +1235,7 @@ def test_normalized_vidaforge_row_builds_preprocess_batch(tmp_path: Path):
     batch = VideoForwardBatchBuilder(seed=7)([next(iter(dataset))])
 
     assert batch.video_loader == [str(video_path)]
-    assert batch.video_file_name == ["clip-a"]
+    assert batch.video_file_name == [_sample_name("clip-a")]
     assert batch.height == [24]
     assert batch.width == [32]
     assert batch.fps == [24.0]
