@@ -16,7 +16,12 @@ import pytest
 from huggingface_hub import HfFileSystem, hf_hub_download
 from torch.utils.data import DataLoader
 
-from fastvideo.configs.configs import DatasetType, PreprocessConfig, VideoLoaderType
+from fastvideo.configs.configs import (
+    DatasetType,
+    PreprocessConfig,
+    PreprocessOutputType,
+    VideoLoaderType,
+)
 from fastvideo.fastvideo_args import WorkloadType
 from fastvideo.pipelines.preprocess.preprocess_stages import (
     VideoTransformStage,
@@ -210,12 +215,29 @@ def test_vidaforge_cli_options_populate_preprocess_config():
         "caption_level_2",
         "--preprocess.vidaforge-selection",
         "reject",
+        "--preprocess.video-loader-type",
+        "torchcodec",
+        "--preprocess.output-type",
+        "vidaforge_automodel",
+        "--preprocess.vidaforge-model-name",
+        "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        "--preprocess.num-frames",
+        "17",
+        "--preprocess.max-height",
+        "144",
+        "--preprocess.max-width",
+        "256",
     ])
 
     config = PreprocessConfig.from_kwargs(vars(args))
 
     assert config is not None
     assert config.dataset_type == DatasetType.VIDAFORGE
+    assert isinstance(config.dataset_type, DatasetType)
+    assert config.video_loader_type == VideoLoaderType.TORCHCODEC
+    assert isinstance(config.video_loader_type, VideoLoaderType)
+    assert config.output_type == PreprocessOutputType.VIDAFORGE_AUTOMODEL
+    assert isinstance(config.output_type, PreprocessOutputType)
     assert config.dataset_path == "manifest"
     assert config.vidaforge_data_root == "data-root"
     assert config.vidaforge_materialize_dir == "materialized"
@@ -235,6 +257,7 @@ def test_build_vidaforge_dataset_normalizes_relative_clip_path(tmp_path: Path):
     assert list(dataset) == [{
         "video": str(expected_video_path.resolve()),
         "name": _sample_name("clip-a"),
+        "clip_id": "clip-a",
         "resolution": {
             "width": 32,
             "height": 24,

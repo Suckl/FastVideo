@@ -1,3 +1,4 @@
+from fastvideo.configs.configs import PreprocessOutputType
 from fastvideo.fastvideo_args import FastVideoArgs
 from fastvideo.pipelines.composed_pipeline_base import ComposedPipelineBase
 from fastvideo.pipelines.preprocess.preprocess_stages import (TextTransformStage, VideoTransformStage)
@@ -43,24 +44,41 @@ class PreprocessPipelineT2V(ComposedPipelineBase):
 
     def create_pipeline_stages(self, fastvideo_args: FastVideoArgs):
         assert fastvideo_args.preprocess_config is not None
-        self.add_stage(stage_name="text_transform_stage",
-                       stage=TextTransformStage(
-                           cfg_uncondition_drop_rate=fastvideo_args.preprocess_config.training_cfg_rate,
-                           seed=fastvideo_args.preprocess_config.seed,
-                       ))
-        self.add_stage(stage_name="prompt_encoding_stage",
-                       stage=TextEncodingStage(
-                           text_encoders=[self.get_module("text_encoder")],
-                           tokenizers=[self.get_module("tokenizer")],
-                       ))
-        self.add_stage(stage_name="video_transform_stage",
-                       stage=VideoTransformStage(
-                           train_fps=fastvideo_args.preprocess_config.train_fps,
-                           num_frames=fastvideo_args.preprocess_config.num_frames,
-                           max_height=fastvideo_args.preprocess_config.max_height,
-                           max_width=fastvideo_args.preprocess_config.max_width,
-                           do_temporal_sample=fastvideo_args.preprocess_config.do_temporal_sample,
-                       ))
+        if fastvideo_args.preprocess_config.output_type == PreprocessOutputType.VIDAFORGE_AUTOMODEL:
+            from fastvideo.pipelines.preprocess.wan.vidaforge_stages import (
+                VidaForgeTextEncodingStage,
+                VidaForgeTextTransformStage,
+                VidaForgeWanVideoTransformStage,
+            )
+            text_transform_stage = VidaForgeTextTransformStage()
+            text_encoding_stage = VidaForgeTextEncodingStage(
+                text_encoders=[self.get_module("text_encoder")],
+                tokenizers=[self.get_module("tokenizer")],
+            )
+            video_transform_stage = VidaForgeWanVideoTransformStage(
+                num_frames=fastvideo_args.preprocess_config.num_frames,
+                max_height=fastvideo_args.preprocess_config.max_height,
+                max_width=fastvideo_args.preprocess_config.max_width,
+            )
+        else:
+            text_transform_stage = TextTransformStage(
+                cfg_uncondition_drop_rate=fastvideo_args.preprocess_config.training_cfg_rate,
+                seed=fastvideo_args.preprocess_config.seed,
+            )
+            text_encoding_stage = TextEncodingStage(
+                text_encoders=[self.get_module("text_encoder")],
+                tokenizers=[self.get_module("tokenizer")],
+            )
+            video_transform_stage = VideoTransformStage(
+                train_fps=fastvideo_args.preprocess_config.train_fps,
+                num_frames=fastvideo_args.preprocess_config.num_frames,
+                max_height=fastvideo_args.preprocess_config.max_height,
+                max_width=fastvideo_args.preprocess_config.max_width,
+                do_temporal_sample=fastvideo_args.preprocess_config.do_temporal_sample,
+            )
+        self.add_stage(stage_name="text_transform_stage", stage=text_transform_stage)
+        self.add_stage(stage_name="prompt_encoding_stage", stage=text_encoding_stage)
+        self.add_stage(stage_name="video_transform_stage", stage=video_transform_stage)
         self.add_stage(stage_name="video_encoding_stage", stage=EncodingStage(vae=self.get_module("vae"), ))
 
 

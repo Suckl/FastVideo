@@ -3,7 +3,7 @@ from typing import cast
 
 from torch.utils.data import DataLoader
 
-from fastvideo.configs.configs import PreprocessConfig
+from fastvideo.configs.configs import PreprocessConfig, PreprocessOutputType
 from fastvideo.dataset.dataloader.record_schema import (basic_t2v_record_creator, i2v_record_creator)
 from fastvideo.dataset.dataloader.schema import (pyarrow_schema_i2v, pyarrow_schema_t2v)
 from fastvideo.distributed.parallel_state import get_world_rank
@@ -113,6 +113,21 @@ class PreprocessWorkflow(WorkflowBase):
 
     @classmethod
     def get_workflow_cls(cls, fastvideo_args: FastVideoArgs) -> "PreprocessWorkflow":
+        assert fastvideo_args.preprocess_config is not None
+        if fastvideo_args.preprocess_config.output_type == PreprocessOutputType.VIDAFORGE_AUTOMODEL:
+            from fastvideo.configs.pipelines.wan import WanT2V480PConfig
+            if fastvideo_args.workload_type != WorkloadType.T2V or not isinstance(fastvideo_args.pipeline_config,
+                                                                                  WanT2V480PConfig):
+                raise ValueError("vidaforge_automodel output currently supports only Wan text-to-video pipelines")
+            if (fastvideo_args.pipeline_config.vae_precision != "fp16"
+                    or tuple(fastvideo_args.pipeline_config.text_encoder_precisions) != ("bf16", )):
+                raise ValueError("vidaforge_automodel output requires --vae-precision fp16 "
+                                 "and --text-encoder-precisions bf16 to match VidaForge Wan")
+            if fastvideo_args.pipeline_config.vae_tiling or fastvideo_args.pipeline_config.vae_sp:
+                raise ValueError("vidaforge_automodel output requires vae_tiling=false and vae_sp=false")
+            from fastvideo.workflow.preprocess.preprocess_workflow_vidaforge_automodel import (
+                PreprocessWorkflowVidaForgeAutoModel, )
+            return cast(PreprocessWorkflow, PreprocessWorkflowVidaForgeAutoModel)
         is_ltx2_t2v = (fastvideo_args.workload_type == WorkloadType.T2V
                        and fastvideo_args.pipeline_config.__class__.__name__ == "LTX2T2VConfig")
         if is_ltx2_t2v:

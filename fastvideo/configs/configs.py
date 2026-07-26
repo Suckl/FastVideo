@@ -54,6 +54,25 @@ class VideoLoaderType(str, Enum):
         return [video_loader.value for video_loader in cls]
 
 
+class PreprocessOutputType(str, Enum):
+    """Output contracts supported by the preprocessing workflow."""
+
+    PARQUET = "parquet"
+    VIDAFORGE_AUTOMODEL = "vidaforge_automodel"
+
+    @classmethod
+    def from_string(cls, value: str) -> "PreprocessOutputType":
+        try:
+            return cls(value.lower())
+        except ValueError:
+            raise ValueError(f"Invalid preprocess output type: {value}. "
+                             f"Must be one of: {', '.join(member.value for member in cls)}") from None
+
+    @classmethod
+    def choices(cls) -> list[str]:
+        return [output_type.value for output_type in cls]
+
+
 @dataclasses.dataclass
 class PreprocessConfig:
     """Configuration for preprocessing operations."""
@@ -67,6 +86,9 @@ class PreprocessConfig:
     vidaforge_materialize_dir: str = ""
     vidaforge_caption_field: str = "caption_level_3"
     vidaforge_selection: str = "auto"
+    output_type: PreprocessOutputType = PreprocessOutputType.PARQUET
+    vidaforge_model_name: str = ""
+    vidaforge_resume: bool = False
 
     # Dataloader configuration
     dataloader_num_workers: int = 1
@@ -137,6 +159,19 @@ class PreprocessConfig:
                                      choices=["auto", "pass", "reject", "all"],
                                      default=PreprocessConfig.vidaforge_selection,
                                      help="VidaForge selection partition to preprocess.")
+        preprocess_args.add_argument(f"--{prefix_with_dot}output-type",
+                                     type=str,
+                                     choices=PreprocessOutputType.choices(),
+                                     default=PreprocessConfig.output_type.value,
+                                     help="Processed dataset contract: Parquet or a Wan VidaForge AutoModel cache.")
+        preprocess_args.add_argument(f"--{prefix_with_dot}vidaforge-model-name",
+                                     type=str,
+                                     default=PreprocessConfig.vidaforge_model_name,
+                                     help="Canonical checkpoint name recorded in generated VidaForge AutoModel caches.")
+        preprocess_args.add_argument(f"--{prefix_with_dot}vidaforge-resume",
+                                     action=StoreBoolean,
+                                     default=PreprocessConfig.vidaforge_resume,
+                                     help="Resume a compatible VidaForge AutoModel cache and skip completed clip IDs.")
 
         # Dataloader
         preprocess_args.add_argument(
@@ -222,10 +257,18 @@ class PreprocessConfig:
             kwargs['dataset_type'] = DatasetType.from_string(kwargs['dataset_type'])
         if 'video_loader_type' in kwargs and isinstance(kwargs['video_loader_type'], str):
             kwargs['video_loader_type'] = VideoLoaderType.from_string(kwargs['video_loader_type'])
+        if 'output_type' in kwargs and isinstance(kwargs['output_type'], str):
+            kwargs['output_type'] = PreprocessOutputType.from_string(kwargs['output_type'])
 
         preprocess_config = cls()
         if not update_config_from_args(preprocess_config, kwargs, prefix="preprocess", pop_args=True):
             return None
+        if isinstance(preprocess_config.dataset_type, str):
+            preprocess_config.dataset_type = DatasetType.from_string(preprocess_config.dataset_type)
+        if isinstance(preprocess_config.video_loader_type, str):
+            preprocess_config.video_loader_type = VideoLoaderType.from_string(preprocess_config.video_loader_type)
+        if isinstance(preprocess_config.output_type, str):
+            preprocess_config.output_type = PreprocessOutputType.from_string(preprocess_config.output_type)
         return preprocess_config
 
     def check_preprocess_config(self) -> None:
@@ -236,6 +279,24 @@ class PreprocessConfig:
                 raise ValueError("vidaforge_caption_field must not be empty")
             if self.vidaforge_selection not in {"auto", "pass", "reject", "all"}:
                 raise ValueError("vidaforge_selection must be one of: auto, pass, reject, all")
+        if self.output_type == PreprocessOutputType.VIDAFORGE_AUTOMODEL:
+            if self.dataset_type != DatasetType.VIDAFORGE:
+                raise ValueError("vidaforge_automodel output currently requires dataset_type=vidaforge")
+            if not self.vidaforge_model_name.strip():
+                raise ValueError("vidaforge_model_name is required for vidaforge_automodel output")
+            if self.training_cfg_rate != 0:
+                raise ValueError("vidaforge_automodel output requires training_cfg_rate=0; "
+                                 "apply CFG dropout in the training dataloader")
+            if self.do_temporal_sample:
+                raise ValueError("vidaforge_automodel output requires do_temporal_sample=false "
+                                 "so resumed samples are deterministic")
+            if self.drop_short_ratio != 1.0:
+                raise ValueError("vidaforge_automodel output requires drop_short_ratio=1 "
+                                 "so short clips cannot create undersized Wan buckets")
+            if self.num_frames <= 0 or (self.num_frames - 1) % 4 != 0:
+                raise ValueError("Wan vidaforge_automodel output requires num_frames=4n+1")
+            if self.max_height <= 0 or self.max_width <= 0 or self.max_height % 16 or self.max_width % 16:
+                raise ValueError("Wan vidaforge_automodel output requires max_height/max_width divisible by 16")
         if self.samples_per_file <= 0:
             raise ValueError("samples_per_file must be greater than 0")
         if self.flush_frequency <= 0:

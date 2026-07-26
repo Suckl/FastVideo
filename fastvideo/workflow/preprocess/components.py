@@ -16,6 +16,7 @@ from fastvideo.dataset.dataloader.parquet_io import (ParquetDatasetWriter, recor
 from fastvideo.distributed.parallel_state import get_world_rank, get_world_size
 from fastvideo.logger import init_logger
 from fastvideo.pipelines.pipeline_batch_info import PreprocessBatch
+from fastvideo.pipelines.preprocess.preprocess_stages import resolve_file_backed_video_path
 from fastvideo.workflow.preprocess.vidaforge_manifest import build_vidaforge_dataset
 
 logger = init_logger(__name__)
@@ -123,6 +124,24 @@ class VideoForwardBatchBuilder:
             data_type="video",
             generator=torch.Generator("cpu").manual_seed(self.seed),
         )
+        forward_batch.extra["source_metadata"] = [{
+            "clip_id":
+            str(item.get("clip_id", item["name"])),
+            "original_filename":
+            str(item["name"]),
+            "original_video_path":
+            resolve_file_backed_video_path(item["video"]),
+            "source_resolution": [
+                int(item["resolution"]["width"]),
+                int(item["resolution"]["height"]),
+            ],
+            "source_fps":
+            float(item["fps"]),
+            "source_frame_count":
+            int(item["num_frames"]),
+            "caption":
+            str(item["caption"]),
+        } for item in batch]
         return forward_batch
 
 

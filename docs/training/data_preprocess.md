@@ -248,6 +248,64 @@ VidaForge Stage 5 AutoModel writes `metadata.json`, JSON metadata shards, and
 one `.meta` tensor file per clip. Point the modular Wan trainer directly at
 the Stage 5 output directory:
 
+FastVideo can produce that cache itself from the Stage 4 or public-release
+input described above. This runs FastVideo's Wan VAE and UMT5 encoder, applies
+the Wan latent mean/std normalization exactly once, and writes a portable
+content-addressed cache:
+
+```bash
+torchrun --nproc_per_node=1 \
+    -m fastvideo.pipelines.preprocess.v1_preprocessing_new \
+    --model-path "Wan-AI/Wan2.1-T2V-1.3B-Diffusers" \
+    --revision "<immutable-Hugging-Face-commit>" \
+    --mode preprocess \
+    --workload-type t2v \
+    --vae-precision fp16 \
+    --text-encoder-precisions bf16 \
+    --preprocess.dataset-type vidaforge \
+    --preprocess.dataset-path "/data/VidaForge-3M/meta/shard-00000.parquet" \
+    --preprocess.vidaforge-data-root "/data/VidaForge-3M" \
+    --preprocess.vidaforge-caption-field caption_level_3 \
+    --preprocess.vidaforge-selection auto \
+    --preprocess.output-type vidaforge_automodel \
+    --preprocess.vidaforge-model-name \
+        "Wan-AI/Wan2.1-T2V-1.3B-Diffusers" \
+    --preprocess.dataset-output-dir "/data/vidaforge-stage5" \
+    --preprocess.max-height 144 \
+    --preprocess.max-width 256 \
+    --preprocess.num-frames 17 \
+    --preprocess.train-fps 16 \
+    --preprocess.samples-per-file 256
+```
+
+This producer currently supports Wan text-to-video caches. The frame count
+must be `4n+1`, both spatial dimensions must be divisible by 16,
+`training_cfg_rate` must be zero, and temporal random sampling must be
+disabled. It uses VidaForge's full-clip linspace sampling, prompt cleanup,
+center crop, and fp16 VAE/bf16 UMT5 precisions. CFG dropout remains a per-epoch
+training decision in the Section 2 loader rather than being permanently baked
+into cached text embeddings.
+`drop_short_ratio` must remain `1`, so a clip that cannot provide the requested
+frame count is rejected instead of creating a smaller, mislabeled Wan bucket.
+
+The output contains `provenance.json`, `metadata.json`, metadata shards, and
+one atomic `.meta` file per clip. `provenance.json` records the resolved model
+revision plus the path and SHA-256 of every VAE/text-encoder weight and
+configuration file. Copy its `vae_fingerprint` and
+`text_encoder_fingerprint` values into the training configuration below.
+Tokenizer files, including `spiece.model`, are included in the text-encoder
+identity because they also affect the resulting embeddings. The same file
+records a `producer_config_fingerprint` over output-affecting settings such as
+resolution, frame count, FPS, caption field, component precision, and tokenizer
+sequence length.
+
+Interrupted runs do not publish partial `.meta` files. To continue a
+previously published compatible cache, add
+`--preprocess.vidaforge-resume`; FastVideo verifies the model provenance,
+skips completed `clip_id` values before encoding, and atomically publishes a
+new merged metadata generation. Distributed ranks write independent progress
+files and rank zero publishes the merged index after all ranks finish.
+
 ```yaml
 training:
   data:
@@ -260,9 +318,9 @@ training:
     dataloader_num_workers: 4
     training_cfg_rate: 0.0
     seed: 42
-    num_height: 480
-    num_width: 832
-    num_latent_t: 21
+    num_height: 144
+    num_width: 256
+    num_latent_t: 5
 ```
 
 The loader keeps each batch within one VidaForge temporal/resolution/latent
@@ -288,9 +346,9 @@ Verified caches must record both `vae_fingerprint` and
 lowercase SHA-256 of a canonical component manifest that includes the immutable
 model revision, component configuration, and the path and SHA-256 of every
 weight file. Configure the two expected fingerprints above; FastVideo compares
-them exactly before using the already-encoded tensors. A future FastVideo
-Stage 5 producer should create these manifests and write the resulting
-fingerprints alongside every cache payload.
+them exactly before using the already-encoded tensors. FastVideo's Stage 5
+producer creates these manifests and writes the resulting fingerprints
+alongside every cache payload.
 
 VidaForge revision `4562d3f` does not yet write component fingerprints. To use
 one of those legacy caches, opt into name-and-shape validation explicitly:
@@ -333,6 +391,24 @@ pytest fastvideo/tests/workflow/test_vidaforge_automodel_official.py -vs
 This smoke test downloads the Wan 2.1 1.3B VAE, UMT5 encoder, and one ranged
 release clip, so run it on a CUDA machine with sufficient VRAM or on Modal.
 
+The native-producer parity gate runs the same official HEVC clip through the
+FastVideo producer, reloads the published cache through the modular training
+loader, and compares its latent, text embedding, and attention mask with the
+pinned VidaForge `WanAutoModelEncoder`:
+
+```bash
+VIDAFORGE_RUN_FASTVIDEO_PRODUCER_SMOKE=1 \
+VIDAFORGE_REFERENCE_DIR=/tmp/VidaForge \
+pytest \
+    fastvideo/tests/workflow/test_vidaforge_fastvideo_producer_official.py \
+    -vs
+```
+
+Run this gate after any change to the native producer, its Wan preprocessing
+stages, or component precision. The earlier
+`test_vidaforge_automodel_official.py` gate proves that FastVideo can read an
+officially produced payload; it does not exercise FastVideo's producer.
+
 ## Creating Your Own Dataset
 
 If you have raw videos and captions in separate files, generate the `videos2caption.json`:
@@ -357,13 +433,16 @@ your_raw_data/
 
 ## Output Format
 
-Preprocessing outputs Parquet files in the `combined_parquet_dataset/` subdirectory containing:
+The default `--preprocess.output-type parquet` writes Parquet files containing:
 
 - `vae_latent_bytes` — VAE-encoded video latent
 - `text_embedding_bytes` — text encoder output
 - `clip_feature_bytes` — CLIP image features (I2V only)
 - `first_frame_latent_bytes` — first frame latent (I2V only)
 - Metadata: shapes, dtypes, and sample identifiers
+
+`--preprocess.output-type vidaforge_automodel` instead writes the Stage 5
+layout documented above directly under `dataset_output_dir`.
 
 ## Examples
 

@@ -83,6 +83,11 @@ class VidaForgeTorchCodecVideo:
 
         return VideoDecoder(self.source).get_frames_at(indices)
 
+    def __len__(self) -> int:
+        from torchcodec.decoders import VideoDecoder
+
+        return len(VideoDecoder(self.source))
+
 
 def resolve_vidaforge_parquet_paths(dataset_path: str | Path) -> list[Path]:
     """Resolve a VidaForge manifest file or its direct Parquet shards."""
@@ -482,6 +487,7 @@ def _normalize_row(
     return {
         "video": video,
         "name": _safe_sample_name(clip_id),
+        "clip_id": clip_id,
         "resolution": {
             "width": media["width"],
             "height": media["height"],
