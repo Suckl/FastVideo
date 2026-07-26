@@ -169,6 +169,42 @@ def _wan_normalize(latents: torch.Tensor, vae: Any) -> torch.Tensor:
     return (latents.float() - mean) / std
 
 
+def _validated_text_mask(
+    text_mask: torch.Tensor,
+    *,
+    sequence_length: int,
+    caption_token_length: int,
+    clip_id: str,
+    pad_short: bool,
+) -> torch.Tensor:
+    mask = text_mask.to(device="cpu", dtype=torch.float32)
+    if mask.ndim == 3 and mask.shape[1] == 1:
+        mask = mask.squeeze(1)
+    if mask.ndim != 2 or mask.shape[0] != 1:
+        raise ValueError("VidaForge producer text mask must have shape [1, M]: "
+                         f"clip_id={clip_id!r}, shape={tuple(mask.shape)}")
+    mask_length = int(mask.shape[1])
+    if mask_length > sequence_length:
+        raise ValueError("VidaForge producer text mask cannot exceed the embedding sequence length: "
+                         f"clip_id={clip_id!r}, mask_length={mask_length}, sequence_length={sequence_length}")
+    if mask_length < sequence_length:
+        if not pad_short:
+            raise ValueError("Stored VidaForge text mask must match the embedding sequence length: "
+                             f"clip_id={clip_id!r}, mask_length={mask_length}, sequence_length={sequence_length}")
+        padded_mask = torch.zeros((1, sequence_length), dtype=mask.dtype)
+        padded_mask[:, :mask_length] = mask
+        mask = padded_mask
+    if not torch.isfinite(mask).all() or not torch.all((mask == 0) | (mask == 1)):
+        raise ValueError(f"VidaForge producer text mask must contain only finite binary values: {clip_id!r}")
+    expected_valid_length = min(caption_token_length, sequence_length)
+    valid_length = int(mask.sum().item())
+    if valid_length != expected_valid_length:
+        raise ValueError("VidaForge producer text mask disagrees with caption_token_length: "
+                         f"clip_id={clip_id!r}, mask_tokens={valid_length}, "
+                         f"caption_token_length={caption_token_length}, sequence_length={sequence_length}")
+    return mask
+
+
 class VidaForgeAutoModelWriter:
     """Write portable Stage 5 cache files and publish an atomic shard index."""
 
@@ -284,9 +320,19 @@ class VidaForgeAutoModelWriter:
         path = _safe_child(self.output_dir, relative_path, kind="cache file")
         latent_cpu = latents.to(device="cpu", dtype=torch.float16)
         embeddings_cpu = text_embeddings.to(device="cpu", dtype=torch.bfloat16)
-        mask_cpu = text_mask.to(device="cpu", dtype=torch.float32)
         if caption_token_length <= 0:
             raise ValueError(f"VidaForge producer caption token length must be positive: {clip_id!r}")
+        if embeddings_cpu.ndim != 3 or embeddings_cpu.shape[0] != 1:
+            raise ValueError("VidaForge producer text embeddings must have shape [1, L, D]: "
+                             f"clip_id={clip_id!r}, shape={tuple(embeddings_cpu.shape)}")
+        sequence_length = int(embeddings_cpu.shape[1])
+        mask_cpu = _validated_text_mask(
+            text_mask,
+            sequence_length=sequence_length,
+            caption_token_length=caption_token_length,
+            clip_id=clip_id,
+            pad_short=True,
+        )
         metadata = {
             "producer": "fastvideo",
             "model_type": "wan",
@@ -301,8 +347,8 @@ class VidaForgeAutoModelWriter:
             "bucket_resolution": [width, height],
             "bucket_frame_count": frame_count,
             "caption_token_length": caption_token_length,
-            "caption_token_max_length": int(embeddings_cpu.shape[1]),
-            "caption_token_truncated": caption_token_length > int(embeddings_cpu.shape[1]),
+            "caption_token_max_length": sequence_length,
+            "caption_token_truncated": caption_token_length > sequence_length,
             "source_resolution": list(source["source_resolution"]),
             "source_fps": float(source["source_fps"]),
             "source_frame_count": int(source["source_frame_count"]),
@@ -469,10 +515,25 @@ class VidaForgeAutoModelWriter:
         if (not isinstance(embeddings, torch.Tensor) or not embeddings.is_floating_point() or embeddings.ndim != 3
                 or embeddings.shape[0] != 1):
             raise ValueError(f"Resumed VidaForge text embeddings are invalid: {cache_path}")
-        if not isinstance(text_mask, torch.Tensor) or tuple(text_mask.shape) != tuple(embeddings.shape[:2]):
-            raise ValueError(f"Resumed VidaForge text mask is invalid: {cache_path}")
         if not isinstance(metadata, dict):
             raise ValueError(f"Resumed VidaForge metadata is invalid: {cache_path}")
+        item_caption_token_length = item.get("caption_token_length")
+        payload_caption_token_length = metadata.get("caption_token_length")
+        if (isinstance(item_caption_token_length, bool) or not isinstance(item_caption_token_length, int)
+                or item_caption_token_length <= 0):
+            raise ValueError(f"Resumed VidaForge index caption_token_length is invalid: {where}")
+        if (isinstance(payload_caption_token_length, bool) or not isinstance(payload_caption_token_length, int)
+                or payload_caption_token_length != item_caption_token_length):
+            raise ValueError(f"Resumed VidaForge payload caption_token_length mismatch in {where}")
+        if not isinstance(text_mask, torch.Tensor):
+            raise ValueError(f"Resumed VidaForge text mask is invalid: {cache_path}")
+        _validated_text_mask(
+            text_mask,
+            sequence_length=int(embeddings.shape[1]),
+            caption_token_length=payload_caption_token_length,
+            clip_id=str(item["clip_id"]),
+            pad_short=False,
+        )
         expected_metadata = {
             "clip_id": str(item["clip_id"]),
             "model_name": self.model_name,

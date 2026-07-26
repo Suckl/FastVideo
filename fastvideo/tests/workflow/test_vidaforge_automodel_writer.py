@@ -79,7 +79,9 @@ def _batch(clip_id: str) -> PreprocessBatch:
         data_type="video",
         latents=torch.tensor([[[[[3.0]]], [[[6.0]]]]]),
         prompt_embeds=[torch.arange(24, dtype=torch.float32).reshape(1, 3, 8)],
-        prompt_attention_mask=[torch.tensor([[1, 1, 0]])],
+        # Wan pads embeddings to 512 but returns a mask only as long as the
+        # longest prompt in the batch. The writer must pad that mask to match.
+        prompt_attention_mask=[torch.tensor([[1, 1]])],
         width=[16],
         height=[16],
         num_frames=[1],
@@ -308,6 +310,39 @@ def test_resume_rejects_payload_that_disagrees_with_index(tmp_path: Path) -> Non
 
     with pytest.raises(ValueError, match="payload clip_id mismatch"):
         _writer(output_dir, model_root, generation="2" * 32, resume=True)
+
+
+@pytest.mark.parametrize(
+    ("tampered_mask", "message"),
+    [
+        (torch.tensor([[1.0, 0.0, 0.0]]), "disagrees with caption_token_length"),
+        (torch.tensor([[1.0, float("nan"), 0.0]]), "finite binary values"),
+    ],
+)
+def test_resume_rejects_tampered_text_mask(
+    tmp_path: Path,
+    tampered_mask: torch.Tensor,
+    message: str,
+) -> None:
+    model_root = tmp_path / "model"
+    output_dir = tmp_path / "cache"
+    _write_model(model_root)
+    first = _writer(output_dir, model_root, generation="3" * 32)
+    first.save_batch(
+        _batch("clip-1"),
+        vae=SimpleNamespace(latents_mean=[1.0, 2.0], latents_std=[2.0, 4.0]),
+    )
+    first.write_rank_progress()
+    first.publish()
+    root = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    item = json.loads((output_dir / root["shards"][0]).read_text(encoding="utf-8"))[0]
+    path = output_dir / item["cache_file"]
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    payload["text_mask"] = tampered_mask
+    torch.save(payload, path)
+
+    with pytest.raises(ValueError, match=message):
+        _writer(output_dir, model_root, generation="4" * 32, resume=True)
 
 
 def test_publish_merges_distributed_rank_progress(tmp_path: Path) -> None:
