@@ -51,9 +51,25 @@ class VidaForgeTextEncodingStage(TextEncodingStage):
 
     @torch.no_grad()
     def forward(self, batch: ForwardBatch, fastvideo_args: FastVideoArgs) -> ForwardBatch:
-        batch = super().forward(batch, fastvideo_args)
         if not isinstance(batch.prompt, list) or len(self.tokenizers) != 1:
             raise ValueError("VidaForge producer requires one tokenizer and a prompt list")
+        if len(self.text_encoders) != 1:
+            raise ValueError("VidaForge producer requires one text encoder")
+        if batch.prompt_embeds or batch.prompt_attention_mask is None or batch.prompt_attention_mask:
+            raise ValueError("VidaForge producer requires empty prompt embedding and attention-mask lists")
+
+        prompt_embeds, prompt_masks = self.encode_text(
+            batch.prompt,
+            fastvideo_args,
+            encoder_index=[0],
+            return_attention_mask=True,
+            max_length=512,
+            truncation=True,
+            padding="max_length",
+        )
+        batch.prompt_embeds.extend(prompt_embeds)
+        batch.prompt_attention_mask.extend(prompt_masks)
+
         tokenized = self.tokenizers[0](
             batch.prompt,
             add_special_tokens=True,

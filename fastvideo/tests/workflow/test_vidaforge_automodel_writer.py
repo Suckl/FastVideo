@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -28,6 +29,7 @@ from fastvideo.workflow.preprocess.vidaforge_automodel_writer import (
 )
 from fastvideo.pipelines.preprocess.wan.vidaforge_stages import (
     clean_vidaforge_prompt,
+    VidaForgeTextEncodingStage,
     VidaForgeWanEncodingStage,
     VidaForgeWanVideoTransformStage,
 )
@@ -350,6 +352,53 @@ def test_vidaforge_wan_encoding_uses_explicit_fp16_input(monkeypatch: pytest.Mon
 
 def test_vidaforge_prompt_cleanup_matches_double_html_unescape() -> None:
     assert clean_vidaforge_prompt("  one &amp;amp; two\n three  ") == "one & two three"
+
+
+def test_vidaforge_text_encoding_uses_official_fixed_padding() -> None:
+
+    class _Tokenizer:
+
+        def __call__(self, prompts: list[str], **kwargs: object) -> dict[str, list[list[int]]]:
+            assert prompts == ["test prompt"]
+            assert kwargs == {
+                "add_special_tokens": True,
+                "padding": False,
+                "truncation": False,
+            }
+            return {"input_ids": [[1, 2, 3]]}
+
+    stage = VidaForgeTextEncodingStage(
+        text_encoders=[object()],
+        tokenizers=[_Tokenizer()],
+    )
+    encoded = torch.ones((1, 512, 8), dtype=torch.bfloat16)
+    mask = torch.cat((torch.ones((1, 3)), torch.zeros((1, 509))), dim=1)
+    stage.encode_text = MagicMock(return_value=([encoded], [mask]))  # type: ignore[method-assign]
+    batch = PreprocessBatch(
+        data_type="video",
+        prompt=["test prompt"],
+        prompt_embeds=[],
+        prompt_attention_mask=[],
+    )
+    args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            text_encoder_configs=[object()],
+        ), )  # type: ignore[arg-type]
+
+    result = stage.forward(batch, args)
+
+    stage.encode_text.assert_called_once_with(  # type: ignore[attr-defined]
+        ["test prompt"],
+        args,
+        encoder_index=[0],
+        return_attention_mask=True,
+        max_length=512,
+        truncation=True,
+        padding="max_length",
+    )
+    assert result.prompt_embeds[0] is encoded
+    assert result.prompt_attention_mask[0] is mask
+    assert result.extra["caption_token_lengths"] == [3]
 
 
 def test_resume_skips_completed_clip_and_rejects_changed_model(tmp_path: Path) -> None:
