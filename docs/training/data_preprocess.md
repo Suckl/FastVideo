@@ -91,11 +91,16 @@ Use `--preprocess.dataset_type hf` and point `--preprocess.dataset_path` to a Hu
 ### VidaForge Manifest
 
 [VidaForge](https://github.com/GAIR-NLP/VidaForge) turns raw videos into
-standardized, segmented, selected, and annotated clips. FastVideo can consume
-either the local Parquet shards produced by VidaForge Stage 4 Caption or Tag,
-or locally downloaded paired Parquet/indexed-TAR shards from the public
-[VidaForge-3M dataset](https://huggingface.co/datasets/VidaForge/VidaForge-3M).
-It does not use VidaForge Stage 5 encoded `.meta` files.
+standardized, segmented, selected, annotated, and training-ready clips.
+FastVideo supports two integration points:
+
+- Stage 4 Caption/Tag Parquet or the public
+  [VidaForge-3M dataset](https://huggingface.co/datasets/VidaForge/VidaForge-3M)
+  as preprocessing input.
+- Stage 5 AutoModel Wan `.meta` caches as direct modular-training input.
+
+Use Stage 4 when FastVideo should run the model encoders itself. Use Stage 5
+when VidaForge already produced the Wan VAE latents and UMT5 embeddings.
 
 #### Stage 4 workspace
 
@@ -228,6 +233,68 @@ VIDAFORGE_RUN_OFFICIAL_HEVC_SMOKE=1 \
 pytest fastvideo/tests/workflow/test_vidaforge_manifest.py \
     -k official_hevc_torchcodec_pipeline_smoke -vs
 ```
+
+#### Stage 5 AutoModel training cache
+
+VidaForge Stage 5 AutoModel writes `metadata.json`, JSON metadata shards, and
+one `.meta` tensor file per clip. Point the modular Wan trainer directly at
+the Stage 5 output directory:
+
+```yaml
+training:
+  data:
+    data_path: /data/vidaforge-stage5
+    preprocessed_data_type: vidaforge_automodel
+    train_batch_size: 1
+    dataloader_num_workers: 4
+    training_cfg_rate: 0.0
+    seed: 42
+    num_height: 480
+    num_width: 832
+    num_latent_t: 21
+```
+
+The loader keeps each batch within one VidaForge temporal/resolution/latent
+bucket and shards global bucket batches across data-parallel groups. All ranks
+inside one FastVideo sequence-parallel group receive the same sample indices.
+It lazily reads `.meta` files with `torch.load(weights_only=True)` and preserves
+their floating-point dtype until the Wan model casts the batch to its training
+dtype.
+
+VidaForge's Wan Stage 5 encoder has already applied the VAE latent mean/std
+normalization. FastVideo marks this data type explicitly and does not normalize
+those latents a second time. Regular FastVideo `t2v` Parquet inputs retain the
+existing runtime normalization.
+
+The Stage 5 cache must use `model_type: wan`. FastVideo validates its
+`model_name` against the Wan checkpoint selected by the training config before
+using a sample. HF repo IDs, same-named local model directories, and standard
+HF snapshot cache paths are recognized. FastVideo derives the attention mask
+from `text_mask` when present, or from
+`caption_token_length` for the standard VidaForge Wan payload. Moving a complete
+Stage 5 output tree is supported even though VidaForge records absolute
+`cache_file` paths; FastVideo rebases missing paths from the bucket directory
+suffix. Metadata-only split directories may continue to reference an existing
+absolute cache tree.
+
+With `drop_last: true` training semantics, every bucket needs at least
+`train_batch_size * data_parallel_group_count` samples. The loader fails early
+with bucket sizes when no complete distributed batch can be formed.
+
+The opt-in GPU smoke test runs the pinned VidaForge Wan encoder on one real
+HEVC clip from VidaForge-3M, writes the official Stage 5 payload, and checks
+that FastVideo loads its tensors bit-exactly:
+
+```bash
+git clone https://github.com/GAIR-NLP/VidaForge /tmp/VidaForge
+git -C /tmp/VidaForge checkout 4562d3fbcbd4861fc74c2859950c0237363681bb
+VIDAFORGE_RUN_OFFICIAL_AUTOMODEL_SMOKE=1 \
+VIDAFORGE_REFERENCE_DIR=/tmp/VidaForge \
+pytest fastvideo/tests/workflow/test_vidaforge_automodel_official.py -vs
+```
+
+This smoke test downloads the Wan 2.1 1.3B VAE, UMT5 encoder, and one ranged
+release clip, so run it on a CUDA machine with sufficient VRAM or on Modal.
 
 ## Creating Your Own Dataset
 

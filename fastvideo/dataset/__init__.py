@@ -10,6 +10,11 @@ from fastvideo.dataset.preprocessing_datasets import VideoCaptionMergedDataset, 
 from fastvideo.dataset.transform import (CenterCropResizeVideo, Normalize255,
                                          TemporalRandomCrop)
 from fastvideo.dataset.validation_dataset import ValidationDataset
+from fastvideo.dataset.vidaforge_automodel_dataset import (
+    build_vidaforge_automodel_dataloader,
+    VidaForgeAutoModelDataset,
+    VidaForgeBucketBatchSampler,
+)
 
 
 def getdataset(args) -> VideoCaptionMergedDataset:
@@ -51,4 +56,7 @@ __all__ = [
     "ValidationDataset",
     "VideoCaptionMergedDataset",
     "TextDataset",
+    "build_vidaforge_automodel_dataloader",
+    "VidaForgeAutoModelDataset",
+    "VidaForgeBucketBatchSampler",
 ]

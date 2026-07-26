@@ -54,3 +54,26 @@ def build_parquet_matrixgame2_train_dataloader(
         seed=int(data_config.seed or 0),
     ))
     return dataloader
+
+
+def build_vidaforge_automodel_train_dataloader(
+    data_config: DataConfig,
+    *,
+    expected_model_name: str,
+) -> Any:
+    """Build a bucketed dataloader for VidaForge Stage 5 Wan caches."""
+
+    if not isinstance(data_config.data_path, str):
+        raise TypeError("VidaForge AutoModel data_path must be one dataset directory")
+    from fastvideo.dataset import (
+        build_vidaforge_automodel_dataloader, )
+
+    _dataset, dataloader = build_vidaforge_automodel_dataloader(
+        data_config.data_path,
+        data_config.train_batch_size,
+        data_config.dataloader_num_workers,
+        cfg_rate=data_config.training_cfg_rate,
+        seed=int(data_config.seed or 0),
+        expected_model_name=expected_model_name,
+    )
+    return dataloader

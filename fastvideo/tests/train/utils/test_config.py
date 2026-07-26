@@ -92,6 +92,20 @@ def test_minimal_yaml_applies_all_defaults(tmp_path: Path) -> None:
     assert t.pipeline_config is None
 
 
+def test_vidaforge_automodel_data_type_is_accepted(tmp_path: Path) -> None:
+    data = _minimal_yaml()
+    data["training"] = {
+        "data": {
+            "data_path": "/data/vidaforge-stage5",
+            "preprocessed_data_type": "vidaforge_automodel",
+        },
+    }
+
+    cfg = load_run_config(_write_yaml(tmp_path, data))
+
+    assert cfg.training.data.preprocessed_data_type == "vidaforge_automodel"
+
+
 def test_full_yaml_populates_all_training_fields(tmp_path: Path) -> None:
     data = _minimal_yaml()
     data["training"] = {

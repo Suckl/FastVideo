@@ -106,6 +106,7 @@ class WanModel(ModelBase):
         self.negative_prompt_embeds: (torch.Tensor | None) = None
         self.negative_prompt_attention_mask: (torch.Tensor | None) = None
         self._requires_negative_conditioning = True
+        self._input_latents_are_normalized = False
 
         # Timestep mechanics.
         self.timestep_shift: float = float(flow_shift)
@@ -171,28 +172,37 @@ class WanModel(ModelBase):
             pyarrow_schema_text_only,
         )
         from fastvideo.train.utils.dataloader import (
-            build_parquet_t2v_train_dataloader, )
+            build_parquet_t2v_train_dataloader,
+            build_vidaforge_automodel_train_dataloader,
+        )
 
         preprocessed_data_type = str(getattr(
             training_config.data,
             "preprocessed_data_type",
             "t2v",
         )).strip().lower()
+        self._input_latents_are_normalized = (preprocessed_data_type == "vidaforge_automodel")
         parquet_schema = pyarrow_schema_t2v
-        if preprocessed_data_type == "text_only":
+        if self._input_latents_are_normalized:
+            self.dataloader = build_vidaforge_automodel_train_dataloader(
+                training_config.data,
+                expected_model_name=str(training_config.model_path),
+            )
+        elif preprocessed_data_type == "text_only":
             parquet_schema = pyarrow_schema_text_only
         elif preprocessed_data_type != "t2v":
             raise ValueError("Unsupported Wan preprocessed_data_type: "
                              f"{preprocessed_data_type!r}")
 
-        text_len = (
-            training_config.pipeline_config.text_encoder_configs[  # type: ignore[union-attr]
-                0].arch_config.text_len)
-        self.dataloader = build_parquet_t2v_train_dataloader(
-            training_config.data,
-            text_len=int(text_len),
-            parquet_schema=parquet_schema,
-        )
+        if not self._input_latents_are_normalized:
+            text_len = (
+                training_config.pipeline_config.text_encoder_configs[  # type: ignore[union-attr]
+                    0].arch_config.text_len)
+            self.dataloader = build_parquet_t2v_train_dataloader(
+                training_config.data,
+                text_len=int(text_len),
+                parquet_schema=parquet_schema,
+            )
         self.start_step = 0
 
     @property
@@ -289,7 +299,7 @@ class WanModel(ModelBase):
         training_batch.encoder_attention_mask = (encoder_attention_mask.to(device, dtype=dtype))
         training_batch.infos = infos
 
-        training_batch.latents = normalize_dit_input("wan", training_batch.latents, self.vae)
+        training_batch.latents = self._normalize_training_latents(training_batch.latents, )
         training_batch = self._prepare_dit_inputs(training_batch, generator)
         training_batch = self._build_attention_metadata(training_batch)
 
@@ -431,6 +441,14 @@ class WanModel(ModelBase):
 
     def _get_training_dtype(self) -> torch.dtype:
         return torch.bfloat16
+
+    def _normalize_training_latents(
+        self,
+        latents: torch.Tensor,
+    ) -> torch.Tensor:
+        if self._input_latents_are_normalized:
+            return latents
+        return normalize_dit_input("wan", latents, self.vae)
 
     def _init_timestep_mechanics(self) -> None:
         assert self.training_config is not None

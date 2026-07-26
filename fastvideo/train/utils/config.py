@@ -372,9 +372,9 @@ def _build_training_config(
         data_path = str(raw_data_path)
 
     preprocessed_data_type = str(da.get("preprocessed_data_type", "t2v") or "t2v").strip().lower()
-    if preprocessed_data_type not in {"t2v", "text_only"}:
+    if preprocessed_data_type not in {"t2v", "text_only", "vidaforge_automodel"}:
         raise ValueError("training.data.preprocessed_data_type must be one of "
-                         "{'t2v', 'text_only'}, got "
+                         "{'t2v', 'text_only', 'vidaforge_automodel'}, got "
                          f"{preprocessed_data_type!r}")
 
     return TrainingConfig(
