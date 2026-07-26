@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import av
-from datasets import Dataset, Video, load_dataset
+from datasets import Dataset, load_dataset
 from torch.utils.data import IterableDataset, get_worker_info
 
 from fastvideo.configs.configs import PreprocessConfig, VideoLoaderType
@@ -69,6 +69,11 @@ class VidaForgeTorchCodecVideo:
     """Pickle-safe lazy TorchCodec source used by the release dataset."""
 
     source: str | bytes
+
+    @property
+    def source_path(self) -> str | None:
+        """Return a file-backed source for stages that require a path."""
+        return self.source if isinstance(self.source, str) else None
 
     def get_frames_at(self, indices: Any) -> Any:
         from torchcodec.decoders import VideoDecoder
@@ -430,7 +435,10 @@ def _normalize_row(
     if manifest_kind == VidaForgeManifestKind.STAGE4:
         clip_path = _resolve_stage4_clip_path(row, data_root)
         media_source: str | bytes = str(clip_path)
-        video: str | VidaForgeTorchCodecVideo = str(clip_path)
+        if video_loader_type == VideoLoaderType.TORCHCODEC:
+            video: str | VidaForgeTorchCodecVideo = VidaForgeTorchCodecVideo(media_source)
+        else:
+            video = str(clip_path)
     else:
         if data_root is None:
             raise ValueError("VidaForge-3M release metadata requires vidaforge_data_root")
@@ -485,15 +493,16 @@ def _resolve_materialize_root(preprocess_config: PreprocessConfig) -> Path | Non
     return None
 
 
-class VidaForgeReleaseIterableDataset(IterableDataset[dict[str, Any]]):
-    """Lazily read, validate, and decode metadata for public release clips."""
+class VidaForgeIterableDataset(IterableDataset[dict[str, Any]]):
+    """Lazily normalize and validate Stage 4 or public release clips."""
 
     def __init__(
         self,
         metadata: Dataset,
         *,
         caption_field: str,
-        data_root: Path,
+        manifest_kind: VidaForgeManifestKind,
+        data_root: Path | None,
         materialize_root: Path | None,
         video_loader_type: VideoLoaderType,
         validator: Callable[[dict[str, Any]], bool],
@@ -502,6 +511,7 @@ class VidaForgeReleaseIterableDataset(IterableDataset[dict[str, Any]]):
         super().__init__()
         self.metadata = metadata
         self.caption_field = caption_field
+        self.manifest_kind = manifest_kind
         self.data_root = data_root
         self.materialize_root = materialize_root
         self.video_loader_type = video_loader_type
@@ -521,7 +531,7 @@ class VidaForgeReleaseIterableDataset(IterableDataset[dict[str, Any]]):
             normalized_row = _normalize_row(
                 row,
                 caption_field=self.caption_field,
-                manifest_kind=VidaForgeManifestKind.RELEASE,
+                manifest_kind=self.manifest_kind,
                 data_root=self.data_root,
                 materialize_root=self.materialize_root,
                 video_loader_type=self.video_loader_type,
@@ -532,9 +542,10 @@ class VidaForgeReleaseIterableDataset(IterableDataset[dict[str, Any]]):
 
         worker_id = worker_info.id if worker_info is not None else 0
         logger.info(
-            "FastVideo validation kept %d of %d normalized VidaForge release rows on rank %d worker %d",
+            "FastVideo validation kept %d of %d normalized VidaForge %s rows on rank %d worker %d",
             validated_count,
             normalized_count,
+            self.manifest_kind.value,
             self.world_rank,
             worker_id,
         )
@@ -546,7 +557,7 @@ def build_vidaforge_dataset(
     preprocess_config: PreprocessConfig,
     split: str,
     validator: Callable[[dict[str, Any]], bool],
-) -> Dataset | VidaForgeReleaseIterableDataset:
+) -> VidaForgeIterableDataset:
     """Load and normalize a VidaForge Stage 4 or public release manifest."""
     if split != "train":
         raise ValueError("VidaForge manifests provide only the train split")
@@ -563,7 +574,22 @@ def build_vidaforge_dataset(
     manifest_kind = _detect_manifest_kind(dataset, caption_field)
     selection_value = _selection_value(manifest_kind, preprocess_config.vidaforge_selection)
 
+    required_columns = _COMMON_REQUIRED_COLUMNS | {caption_field}
+    if manifest_kind == VidaForgeManifestKind.STAGE4:
+        required_columns |= _STAGE4_REQUIRED_COLUMNS
+    else:
+        required_columns |= _RELEASE_REQUIRED_COLUMNS
+    dataset = dataset.select_columns(sorted(required_columns))
+
     source_count = len(dataset)
+    world_size = get_world_size()
+    world_rank = get_world_rank()
+    if source_count < world_size:
+        raise ValueError(
+            f"VidaForge preprocessing requires at least one source row per rank, but found {source_count} rows "
+            f"for world size {world_size}; reduce the preprocessing world size.")
+    dataset = dataset.shard(num_shards=world_size, index=world_rank, contiguous=True)
+    rank_source_count = len(dataset)
     dataset = dataset.filter(
         _row_is_eligible,
         fn_kwargs={
@@ -575,27 +601,24 @@ def build_vidaforge_dataset(
     )
     eligible_count = len(dataset)
     logger.info(
-        "VidaForge %s manifest selected %d of %d rows (selection=%s, caption_field=%s)",
+        "VidaForge %s manifest selected %d of %d rows on rank %d "
+        "(global source rows=%d, selection=%s, caption_field=%s)",
         manifest_kind.value,
         eligible_count,
+        rank_source_count,
+        world_rank,
         source_count,
         preprocess_config.vidaforge_selection,
         caption_field,
     )
     if eligible_count == 0:
-        raise ValueError(f"VidaForge {manifest_kind.value} manifest produced no eligible rows for "
-                         f"selection={preprocess_config.vidaforge_selection!r} and caption_field={caption_field!r}.")
+        raise ValueError(f"VidaForge {manifest_kind.value} manifest produced no eligible rows on rank {world_rank} "
+                         f"for selection={preprocess_config.vidaforge_selection!r} "
+                         f"and caption_field={caption_field!r}.")
 
     _validate_unique_column(dataset, "clip_id")
     if manifest_kind == VidaForgeManifestKind.RELEASE:
         _validate_unique_column(dataset, "clip_path")
-    world_size = get_world_size()
-    world_rank = get_world_rank()
-    if eligible_count < world_size:
-        raise ValueError(
-            f"VidaForge preprocessing requires at least one eligible row per rank, but found {eligible_count} rows "
-            f"for world size {world_size}; reduce the preprocessing world size.")
-    dataset = dataset.shard(num_shards=world_size, index=world_rank)
 
     data_root = _resolve_data_root(preprocess_config)
     if manifest_kind == VidaForgeManifestKind.RELEASE and data_root is None:
@@ -604,49 +627,13 @@ def build_vidaforge_dataset(
     materialize_root = (_resolve_materialize_root(preprocess_config)
                         if manifest_kind == VidaForgeManifestKind.RELEASE else None)
 
-    if manifest_kind == VidaForgeManifestKind.RELEASE:
-        assert data_root is not None
-        return VidaForgeReleaseIterableDataset(
-            dataset,
-            caption_field=caption_field,
-            data_root=data_root,
-            materialize_root=materialize_root,
-            video_loader_type=preprocess_config.video_loader_type,
-            validator=validator,
-            world_rank=world_rank,
-        )
-
-    source_columns = dataset.column_names
-    dataset = dataset.map(
-        _normalize_row,
-        fn_kwargs={
-            "caption_field": caption_field,
-            "manifest_kind": manifest_kind,
-            "data_root": data_root,
-            "materialize_root": materialize_root,
-            "video_loader_type": preprocess_config.video_loader_type,
-        },
-        remove_columns=source_columns,
-        load_from_cache_file=False,
-        desc="Normalizing VidaForge rows",
+    return VidaForgeIterableDataset(
+        dataset,
+        caption_field=caption_field,
+        manifest_kind=manifest_kind,
+        data_root=data_root,
+        materialize_root=materialize_root,
+        video_loader_type=preprocess_config.video_loader_type,
+        validator=validator,
+        world_rank=world_rank,
     )
-    normalized_count = len(dataset)
-    dataset = dataset.filter(
-        validator,
-        load_from_cache_file=False,
-        desc="Validating VidaForge rows",
-    )
-    validated_count = len(dataset)
-    logger.info(
-        "FastVideo validation kept %d of %d normalized VidaForge %s rows on rank %d",
-        validated_count,
-        normalized_count,
-        manifest_kind.value,
-        world_rank,
-    )
-    if normalized_count > 0 and validated_count == 0:
-        raise ValueError("VidaForge manifest produced no rows that satisfy FastVideo preprocessing constraints.")
-
-    if preprocess_config.video_loader_type == VideoLoaderType.TORCHCODEC:
-        dataset = dataset.cast_column("video", Video())
-    return dataset

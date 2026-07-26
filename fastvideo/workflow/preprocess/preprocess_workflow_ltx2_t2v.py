@@ -159,6 +159,7 @@ class PreprocessWorkflowLTX2T2V(PreprocessWorkflow):
             forward_batch = self.preprocess_pipeline.forward(forward_batch, self.fastvideo_args)
             self.precomputed_saver.save_batch(forward_batch)
             total_samples += len(forward_batch.video_file_name)
+        self._require_training_samples(total_samples)
         logger.info(
             "Finished LTX-2 preprocessing on rank %s with %s samples written to %s",
             get_world_rank(),

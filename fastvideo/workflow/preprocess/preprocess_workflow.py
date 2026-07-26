@@ -19,6 +19,13 @@ logger = init_logger(__name__)
 
 class PreprocessWorkflow(WorkflowBase):
 
+    @staticmethod
+    def _require_training_samples(total_samples: int) -> None:
+        if total_samples == 0:
+            raise ValueError("Training preprocessing produced no samples on this rank. "
+                             "All input rows may have been rejected by dataset validation; "
+                             "check the preprocessing constraints and input metadata.")
+
     def register_pipelines(self) -> None:
         self.add_pipeline_config("preprocess_pipeline", (PipelineType.PREPROCESS, self.fastvideo_args))
 

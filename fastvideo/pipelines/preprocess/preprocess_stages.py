@@ -1,6 +1,6 @@
 import random
 from collections.abc import Callable
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -13,6 +13,14 @@ from fastvideo.dataset.transform import (CenterCropResizeVideo, TemporalRandomCr
 from fastvideo.fastvideo_args import FastVideoArgs, WorkloadType
 from fastvideo.pipelines.pipeline_batch_info import (ForwardBatch, PreprocessBatch)
 from fastvideo.pipelines.stages.base import PipelineStage
+
+
+def resolve_file_backed_video_path(video_input: Any) -> str | None:
+    """Resolve a path from a string or a decoder wrapper with ``source_path``."""
+    if isinstance(video_input, str):
+        return video_input
+    source_path = getattr(video_input, "source_path", None)
+    return source_path if isinstance(source_path, str) else None
 
 
 class VideoTransformStage(PipelineStage):

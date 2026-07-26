@@ -170,7 +170,9 @@ FastVideo uses and verifies that extracted clip. Otherwise the default
 TorchCodec path lazily reads only the requested clip's byte range from the
 paired uncompressed TAR, verifies its SHA-256, and decodes the verified bytes
 without creating a persistent copy. The input is sharded across distributed
-ranks and DataLoader workers before video bytes are read.
+ranks before metadata filtering and integrity checks, then across DataLoader
+workers before video bytes are read. Stage 4 inputs use the same lazy media
+path: MP4 files are not probed until a DataLoader worker consumes the row.
 
 Set `vidaforge_materialize_dir` to opt into a persistent, content-addressed
 clip cache. The Torchvision loader requires files and therefore materializes
@@ -179,6 +181,13 @@ clips automatically; when no cache path is configured, it uses
 atomically. A persistent cache can grow to roughly the size of the downloaded
 TAR data, so place it on storage with enough space or omit it when using
 TorchCodec.
+
+LTX-2 audio preprocessing requires a file-backed video source. When using
+`with_audio=True` with the public release and TorchCodec, set
+`vidaforge_materialize_dir` (or pre-extract clips under
+`<vidaforge_data_root>/data/<clip_path>`). The default in-memory byte source
+supports video decoding but cannot be passed to Torchaudio for audio
+extraction.
 
 `vidaforge_selection` accepts `auto` (the default), `pass`, `reject`, or `all`.
 For Stage 4, `auto` means `pass`. For the public release, whose selection
@@ -207,7 +216,9 @@ extra clip cache.
 
 To verify the exact decoder path without downloading a full TAR shard, run
 the opt-in smoke test on Linux. It fetches one pinned official metadata row
-and only that HEVC clip's byte range:
+and only that HEVC clip's byte range. This is a component-level integration
+test through `VideoTransformStage`; it does not run model encoders or write
+the final processed dataset:
 
 ```bash
 VIDAFORGE_RUN_OFFICIAL_HEVC_SMOKE=1 \

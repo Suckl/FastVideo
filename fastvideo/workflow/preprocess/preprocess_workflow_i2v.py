@@ -22,15 +22,18 @@ class PreprocessWorkflowI2V(PreprocessWorkflow):
 
     def run(self) -> None:
         # Training dataset preprocessing
+        total_training_samples = 0
         for batch in tqdm(self.training_dataloader, desc="Preprocessing training dataset", unit="batch"):
             forward_batch: PreprocessBatch = self.video_forward_batch_builder(batch)
 
             forward_batch = self.preprocess_pipeline.forward(forward_batch, self.fastvideo_args)
 
             self.processed_dataset_saver.save_and_write_parquet_batch(forward_batch, self.training_dataset_output_dir)
+            total_training_samples += len(forward_batch.video_file_name)
 
         self.processed_dataset_saver.flush_tables()
         self.processed_dataset_saver.clean_up()
+        self._require_training_samples(total_training_samples)
 
         # Validation dataset preprocessing
         if self.validation_dataloader is not None:

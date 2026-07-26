@@ -35,7 +35,11 @@ from fastvideo.models.audio.ltx2_audio_vae import LTX2AudioEncoder
 from fastvideo.models.hf_transformer_utils import get_diffusers_config
 from fastvideo.pipelines.composed_pipeline_base import ComposedPipelineBase
 from fastvideo.pipelines.pipeline_batch_info import ForwardBatch, PreprocessBatch
-from fastvideo.pipelines.preprocess.preprocess_stages import (TextTransformStage, VideoTransformStage)
+from fastvideo.pipelines.preprocess.preprocess_stages import (
+    TextTransformStage,
+    VideoTransformStage,
+    resolve_file_backed_video_path,
+)
 from fastvideo.pipelines.stages import EncodingStage, PipelineStage
 
 logger = init_logger(__name__)
@@ -137,9 +141,10 @@ class LTX2AudioEncodingStage(PipelineStage):
 
         audio_latents: list[torch.Tensor | None] = []
         for idx, video_input in enumerate(batch.video_loader):
-            if not isinstance(video_input, str):
+            video_path = resolve_file_backed_video_path(video_input)
+            if video_path is None:
                 logger.warning(
-                    "Skipping audio for sample %s: video loader is not a path string",
+                    "Skipping audio for sample %s: video loader has no file-backed source",
                     idx,
                 )
                 audio_latents.append(None)
@@ -150,7 +155,7 @@ class LTX2AudioEncodingStage(PipelineStage):
                 fps = float(self.fallback_fps)
             target_duration = float(batch.num_frames[idx]) / fps
 
-            audio_data = self._extract_audio(video_input, target_duration)
+            audio_data = self._extract_audio(video_path, target_duration)
             if audio_data is None:
                 audio_latents.append(None)
                 continue
