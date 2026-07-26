@@ -170,9 +170,12 @@ FastVideo uses and verifies that extracted clip. Otherwise the default
 TorchCodec path lazily reads only the requested clip's byte range from the
 paired uncompressed TAR, verifies its SHA-256, and decodes the verified bytes
 without creating a persistent copy. The input is sharded across distributed
-ranks before metadata filtering and integrity checks, then across DataLoader
-workers before video bytes are read. Stage 4 inputs use the same lazy media
-path: MP4 files are not probed until a DataLoader worker consumes the row.
+ranks only after eligibility filtering and global uniqueness checks, then
+across DataLoader workers before video bytes are read. In distributed runs,
+rank zero prepares a shared eligible-row indices cache under
+`<dataset_output_dir>/.vidaforge_metadata_cache`; other ranks reuse it before
+sharding. Stage 4 inputs use the same lazy media path: MP4 files are not probed
+until a DataLoader worker consumes the row.
 
 Set `vidaforge_materialize_dir` to opt into a persistent, content-addressed
 clip cache. The Torchvision loader requires files and therefore materializes

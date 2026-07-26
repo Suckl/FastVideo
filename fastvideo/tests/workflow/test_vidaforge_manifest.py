@@ -43,6 +43,18 @@ def _drop_all(_row):
     return False
 
 
+class _SequentialBroadcastGroup:
+
+    def __init__(self):
+        self.value = None
+
+    def broadcast_object(self, value, src=0):
+        assert src == 0
+        if value is not None:
+            self.value = value
+        return self.value
+
+
 def _write_parquet(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.Table.from_pylist(rows), path)
@@ -767,18 +779,23 @@ def test_build_vidaforge_release_requires_data_root(tmp_path: Path):
         build_dataset(_config(manifest_path), split="train", validator=lambda row: True)
 
 
-def test_build_vidaforge_dataset_rejects_empty_distributed_shard(tmp_path: Path, monkeypatch):
+def test_build_vidaforge_dataset_rejects_more_ranks_than_eligible_rows(tmp_path: Path, monkeypatch):
     video_path = _video_path(tmp_path, "clip.mp4").resolve()
     manifest_path = tmp_path / "clip-00000.parquet"
     _write_parquet(manifest_path, [_row(clip_id="clip-a", clip_path=str(video_path))])
     monkeypatch.setattr(vidaforge_manifest, "get_world_size", lambda: 2)
-    monkeypatch.setattr(vidaforge_manifest, "get_world_rank", lambda: 1)
+    monkeypatch.setattr(vidaforge_manifest, "get_world_rank", lambda: 0)
+    monkeypatch.setattr(vidaforge_manifest, "get_world_group", lambda: _SequentialBroadcastGroup())
 
-    with pytest.raises(ValueError, match="requires at least one source row per rank"):
-        build_dataset(_config(manifest_path), split="train", validator=lambda row: True)
+    with pytest.raises(ValueError, match="requires at least one eligible row per rank"):
+        build_dataset(
+            _config(manifest_path, dataset_output_dir=str(tmp_path / "output")),
+            split="train",
+            validator=lambda row: True,
+        )
 
 
-def test_vidaforge_metadata_is_pruned_and_rank_sharded_before_unique_checks(tmp_path: Path, monkeypatch):
+def test_vidaforge_metadata_is_filtered_and_validated_globally_before_rank_sharding(tmp_path: Path, monkeypatch):
     data_root = tmp_path / "vidaforge"
     rows = []
     for index in range(4):
@@ -789,8 +806,13 @@ def test_vidaforge_metadata_is_pruned_and_rank_sharded_before_unique_checks(tmp_
         rows.append(row)
     manifest_path = tmp_path / "clip-00000.parquet"
     _write_parquet(manifest_path, rows)
+    current_rank = {
+        "value": 0,
+    }
+    broadcast_group = _SequentialBroadcastGroup()
     monkeypatch.setattr(vidaforge_manifest, "get_world_size", lambda: 2)
-    monkeypatch.setattr(vidaforge_manifest, "get_world_rank", lambda: 1)
+    monkeypatch.setattr(vidaforge_manifest, "get_world_rank", lambda: current_rank["value"])
+    monkeypatch.setattr(vidaforge_manifest, "get_world_group", lambda: broadcast_group)
     checked_lengths = []
 
     def _record_unique_check(dataset, column):
@@ -798,15 +820,85 @@ def test_vidaforge_metadata_is_pruned_and_rank_sharded_before_unique_checks(tmp_
 
     monkeypatch.setattr(vidaforge_manifest, "_validate_unique_column", _record_unique_check)
 
-    dataset = build_dataset(
-        _config(manifest_path, data_root=data_root),
+    config = _config(
+        manifest_path,
+        data_root=data_root,
+        dataset_output_dir=str(tmp_path / "output"),
+    )
+    rank_zero_dataset = build_dataset(
+        config,
         split="train",
         validator=_keep_all,
     )
+    current_rank["value"] = 1
+    rank_one_dataset = build_dataset(config, split="train", validator=_keep_all)
 
-    assert checked_lengths == [("clip_id", 2)]
-    assert "unused_large_column" not in dataset.metadata.column_names
-    assert [row["name"] for row in dataset] == ["clip-2", "clip-3"]
+    assert checked_lengths == [("clip_id", 4)]
+    assert "unused_large_column" not in rank_zero_dataset.metadata.column_names
+    assert "unused_large_column" not in rank_one_dataset.metadata.column_names
+    assert [row["name"] for row in rank_zero_dataset] == ["clip-0", "clip-1"]
+    assert [row["name"] for row in rank_one_dataset] == ["clip-2", "clip-3"]
+
+
+def test_vidaforge_global_filter_balances_eligible_rows_across_ranks(tmp_path: Path, monkeypatch):
+    data_root = tmp_path / "vidaforge"
+    rows = []
+    for index in range(4):
+        relative_path = f"data/clip-{index}.mp4"
+        _video_path(data_root, relative_path)
+        rows.append(
+            _row(
+                clip_id=f"clip-{index}",
+                clip_path=relative_path,
+                select_pass=0 if index < 2 else 1,
+            ))
+    manifest_path = tmp_path / "clip-00000.parquet"
+    _write_parquet(manifest_path, rows)
+    current_rank = {
+        "value": 0,
+    }
+    broadcast_group = _SequentialBroadcastGroup()
+    monkeypatch.setattr(vidaforge_manifest, "get_world_size", lambda: 2)
+    monkeypatch.setattr(vidaforge_manifest, "get_world_rank", lambda: current_rank["value"])
+    monkeypatch.setattr(vidaforge_manifest, "get_world_group", lambda: broadcast_group)
+    config = _config(
+        manifest_path,
+        data_root=data_root,
+        dataset_output_dir=str(tmp_path / "output"),
+    )
+
+    rank_zero_dataset = build_dataset(config, split="train", validator=_keep_all)
+    current_rank["value"] = 1
+    rank_one_dataset = build_dataset(config, split="train", validator=_keep_all)
+
+    assert [row["name"] for row in rank_zero_dataset] == ["clip-2"]
+    assert [row["name"] for row in rank_one_dataset] == ["clip-3"]
+
+
+def test_vidaforge_global_unique_check_catches_duplicate_across_rank_boundary(tmp_path: Path, monkeypatch):
+    data_root = tmp_path / "vidaforge"
+    rows = []
+    clip_ids = ["duplicate", "clip-1", "duplicate", "clip-3"]
+    for index, clip_id in enumerate(clip_ids):
+        relative_path = f"data/clip-{index}.mp4"
+        _video_path(data_root, relative_path)
+        rows.append(_row(clip_id=clip_id, clip_path=relative_path))
+    manifest_path = tmp_path / "clip-00000.parquet"
+    _write_parquet(manifest_path, rows)
+    monkeypatch.setattr(vidaforge_manifest, "get_world_size", lambda: 2)
+    monkeypatch.setattr(vidaforge_manifest, "get_world_rank", lambda: 0)
+    monkeypatch.setattr(vidaforge_manifest, "get_world_group", lambda: _SequentialBroadcastGroup())
+
+    with pytest.raises(ValueError, match="duplicate clip_id"):
+        build_dataset(
+            _config(
+                manifest_path,
+                data_root=data_root,
+                dataset_output_dir=str(tmp_path / "output"),
+            ),
+            split="train",
+            validator=_keep_all,
+        )
 
 
 def test_build_vidaforge_release_shards_rows_across_dataloader_workers(tmp_path: Path, monkeypatch):

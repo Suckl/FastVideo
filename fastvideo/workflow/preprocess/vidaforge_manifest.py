@@ -19,11 +19,12 @@ from pathlib import Path
 from typing import Any
 
 import av
+import pyarrow.compute as pc
 from datasets import Dataset, load_dataset
 from torch.utils.data import IterableDataset, get_worker_info
 
 from fastvideo.configs.configs import PreprocessConfig, VideoLoaderType
-from fastvideo.distributed.parallel_state import get_world_rank, get_world_size
+from fastvideo.distributed.parallel_state import get_world_group, get_world_rank, get_world_size
 from fastvideo.logger import init_logger
 
 logger = init_logger(__name__)
@@ -57,6 +58,7 @@ _RELEASE_REQUIRED_COLUMNS = frozenset({
     "tar_path",
 })
 _COPY_CHUNK_SIZE = 8 * 1024 * 1024
+_METADATA_CACHE_VERSION = 1
 
 
 class VidaForgeManifestKind(str, Enum):
@@ -469,10 +471,150 @@ def _normalize_row(
 
 
 def _validate_unique_column(dataset: Dataset, column: str) -> None:
-    unique_values = dataset.unique(column)
-    if len(unique_values) != len(dataset):
+    unique_count = int(pc.count_distinct(dataset.with_format("arrow")[column]).as_py())
+    if unique_count != len(dataset):
         raise ValueError(f"VidaForge manifest contains duplicate {column} values: "
-                         f"{len(dataset)} eligible rows but {len(unique_values)} unique values")
+                         f"{len(dataset)} eligible rows but {unique_count} unique values")
+
+
+def _metadata_cache_path(
+    preprocess_config: PreprocessConfig,
+    parquet_paths: list[Path],
+    *,
+    caption_field: str,
+    manifest_kind: VidaForgeManifestKind,
+    selection_value: int | None,
+) -> Path:
+    digest = hashlib.sha256()
+    digest.update(f"fastvideo-vidaforge-metadata-v{_METADATA_CACHE_VERSION}\0".encode())
+    digest.update(f"{caption_field}\0{manifest_kind.value}\0{selection_value!r}\0".encode())
+    for path in parquet_paths:
+        stat = path.stat()
+        digest.update(f"{path}\0{stat.st_size}\0{stat.st_mtime_ns}\0".encode())
+    cache_root = Path(preprocess_config.dataset_output_dir).expanduser().resolve() / ".vidaforge_metadata_cache"
+    return cache_root / f"{digest.hexdigest()}.arrow"
+
+
+def _filter_eligible_rows(
+    dataset: Dataset,
+    *,
+    caption_field: str,
+    manifest_kind: VidaForgeManifestKind,
+    selection_value: int | None,
+    cache_file_name: Path | None = None,
+) -> Dataset:
+    filter_kwargs: dict[str, Any] = {}
+    if cache_file_name is not None:
+        filter_kwargs["cache_file_name"] = str(cache_file_name)
+    return dataset.filter(
+        _row_is_eligible,
+        fn_kwargs={
+            "caption_field": caption_field,
+            "manifest_kind": manifest_kind,
+            "selection_value": selection_value,
+        },
+        load_from_cache_file=True,
+        desc="Filtering VidaForge rows",
+        **filter_kwargs,
+    )
+
+
+def _prepare_global_metadata(
+    dataset: Dataset,
+    preprocess_config: PreprocessConfig,
+    parquet_paths: list[Path],
+    *,
+    caption_field: str,
+    manifest_kind: VidaForgeManifestKind,
+    selection_value: int | None,
+    world_size: int,
+    world_rank: int,
+) -> Dataset:
+    """Filter and validate globally before rank sharding.
+
+    Rank zero creates a shared Hugging Face indices cache and performs the
+    global uniqueness checks. Other ranks load the same eligible-row cache.
+    """
+    if world_size == 1:
+        single_rank_dataset = _filter_eligible_rows(
+            dataset,
+            caption_field=caption_field,
+            manifest_kind=manifest_kind,
+            selection_value=selection_value,
+        )
+        if len(single_rank_dataset) == 0:
+            raise ValueError(f"VidaForge {manifest_kind.value} manifest produced no eligible rows "
+                             f"for selection={preprocess_config.vidaforge_selection!r} "
+                             f"and caption_field={caption_field!r}.")
+        _validate_unique_column(single_rank_dataset, "clip_id")
+        if manifest_kind == VidaForgeManifestKind.RELEASE:
+            _validate_unique_column(single_rank_dataset, "clip_path")
+        return single_rank_dataset
+
+    cache_path = _metadata_cache_path(
+        preprocess_config,
+        parquet_paths,
+        caption_field=caption_field,
+        manifest_kind=manifest_kind,
+        selection_value=selection_value,
+    )
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    eligible_dataset: Dataset | None = None
+    rank_zero_error: Exception | None = None
+    status: dict[str, int | str | None] | None = None
+    if world_rank == 0:
+        try:
+            eligible_dataset = _filter_eligible_rows(
+                dataset,
+                caption_field=caption_field,
+                manifest_kind=manifest_kind,
+                selection_value=selection_value,
+                cache_file_name=cache_path,
+            )
+            eligible_count = len(eligible_dataset)
+            if eligible_count < world_size:
+                raise ValueError(
+                    f"VidaForge preprocessing requires at least one eligible row per rank, but found "
+                    f"{eligible_count} rows for world size {world_size}; reduce the preprocessing world size.")
+            _validate_unique_column(eligible_dataset, "clip_id")
+            if manifest_kind == VidaForgeManifestKind.RELEASE:
+                _validate_unique_column(eligible_dataset, "clip_path")
+            status = {
+                "eligible_count": eligible_count,
+                "error": None,
+            }
+        except Exception as exc:
+            rank_zero_error = exc
+            status = {
+                "eligible_count": -1,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    status = get_world_group().broadcast_object(status, src=0)
+    if not isinstance(status, dict):
+        raise RuntimeError("VidaForge metadata preparation did not receive rank-zero status")
+    error = status.get("error")
+    if error is not None:
+        if rank_zero_error is not None:
+            raise rank_zero_error
+        raise ValueError(f"VidaForge metadata preparation failed on rank 0: {error}")
+
+    status_eligible_count = status.get("eligible_count")
+    if not isinstance(status_eligible_count, int) or status_eligible_count < world_size:
+        raise RuntimeError(f"VidaForge metadata preparation returned invalid eligible count: {status_eligible_count!r}")
+    if eligible_dataset is None:
+        eligible_dataset = _filter_eligible_rows(
+            dataset,
+            caption_field=caption_field,
+            manifest_kind=manifest_kind,
+            selection_value=selection_value,
+            cache_file_name=cache_path,
+        )
+    if len(eligible_dataset) != status_eligible_count:
+        raise RuntimeError(f"VidaForge eligible metadata cache contains {len(eligible_dataset)} rows, "
+                           f"expected {status_eligible_count}")
+    return eligible_dataset
 
 
 def _resolve_data_root(preprocess_config: PreprocessConfig) -> Path | None:
@@ -581,44 +723,33 @@ def build_vidaforge_dataset(
         required_columns |= _RELEASE_REQUIRED_COLUMNS
     dataset = dataset.select_columns(sorted(required_columns))
 
-    source_count = len(dataset)
     world_size = get_world_size()
     world_rank = get_world_rank()
-    if source_count < world_size:
-        raise ValueError(
-            f"VidaForge preprocessing requires at least one source row per rank, but found {source_count} rows "
-            f"for world size {world_size}; reduce the preprocessing world size.")
-    dataset = dataset.shard(num_shards=world_size, index=world_rank, contiguous=True)
-    rank_source_count = len(dataset)
-    dataset = dataset.filter(
-        _row_is_eligible,
-        fn_kwargs={
-            "caption_field": caption_field,
-            "manifest_kind": manifest_kind,
-            "selection_value": selection_value,
-        },
-        desc="Filtering VidaForge rows",
+    source_count = len(dataset)
+    dataset = _prepare_global_metadata(
+        dataset,
+        preprocess_config,
+        parquet_paths,
+        caption_field=caption_field,
+        manifest_kind=manifest_kind,
+        selection_value=selection_value,
+        world_size=world_size,
+        world_rank=world_rank,
     )
-    eligible_count = len(dataset)
+    global_eligible_count = len(dataset)
+    dataset = dataset.shard(num_shards=world_size, index=world_rank, contiguous=True)
+    rank_eligible_count = len(dataset)
     logger.info(
-        "VidaForge %s manifest selected %d of %d rows on rank %d "
+        "VidaForge %s manifest assigned %d of %d globally eligible rows to rank %d "
         "(global source rows=%d, selection=%s, caption_field=%s)",
         manifest_kind.value,
-        eligible_count,
-        rank_source_count,
+        rank_eligible_count,
+        global_eligible_count,
         world_rank,
         source_count,
         preprocess_config.vidaforge_selection,
         caption_field,
     )
-    if eligible_count == 0:
-        raise ValueError(f"VidaForge {manifest_kind.value} manifest produced no eligible rows on rank {world_rank} "
-                         f"for selection={preprocess_config.vidaforge_selection!r} "
-                         f"and caption_field={caption_field!r}.")
-
-    _validate_unique_column(dataset, "clip_id")
-    if manifest_kind == VidaForgeManifestKind.RELEASE:
-        _validate_unique_column(dataset, "clip_path")
 
     data_root = _resolve_data_root(preprocess_config)
     if manifest_kind == VidaForgeManifestKind.RELEASE and data_root is None:
