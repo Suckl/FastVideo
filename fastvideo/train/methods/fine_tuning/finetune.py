@@ -32,6 +32,18 @@ class FineTuneMethod(TrainingMethod):
                              "trainable")
         self._attn_kind: Literal["dense", "vsa"] = (self._infer_attn_kind())
 
+        # Fine-tuning always performs a conditional forward. Avoid loading a
+        # text encoder just to create negative-prompt embeddings that this
+        # method never reads. Methods with unconditional passes (for example
+        # DMD2) configure this independently.
+        set_requires_negative_conditioning = getattr(
+            self.student,
+            "set_requires_negative_conditioning",
+            None,
+        )
+        if callable(set_requires_negative_conditioning):
+            set_requires_negative_conditioning(False)
+
         # Initialize preprocessors on student.
         self.student.init_preprocessors(self.training_config)
 

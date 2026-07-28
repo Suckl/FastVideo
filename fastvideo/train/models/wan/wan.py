@@ -156,12 +156,6 @@ class WanModel(ModelBase):
     # ------------------------------------------------------------------
 
     def init_preprocessors(self, training_config: TrainingConfig) -> None:
-        self.vae = load_module_from_path(
-            model_path=str(training_config.model_path),
-            module_type="vae",
-            training_config=training_config,
-        )
-
         self.world_group = get_world_group()
         self.sp_group = get_sp_group()
 
@@ -196,6 +190,7 @@ class WanModel(ModelBase):
                              f"{preprocessed_data_type!r}")
 
         if not self._input_latents_are_normalized:
+            self.ensure_vae()
             text_len = (
                 training_config.pipeline_config.text_encoder_configs[  # type: ignore[union-attr]
                     0].arch_config.text_len)
@@ -230,16 +225,15 @@ class WanModel(ModelBase):
         self,
         latents_b_t_c_h_w: torch.Tensor,
     ) -> torch.Tensor:
-        if self.vae is None:
-            raise RuntimeError("Wan VAE is not initialized")
+        vae = self.ensure_vae()
         latents = latents_b_t_c_h_w.permute(0, 2, 1, 3, 4).float()
-        if bool(getattr(self.vae, "handles_latent_denorm", False)):
+        if bool(getattr(vae, "handles_latent_denorm", False)):
             denorm = latents
         else:
-            mean = torch.tensor(self.vae.latents_mean, device=latents.device, dtype=latents.dtype).view(1, -1, 1, 1, 1)
-            std = torch.tensor(self.vae.latents_std, device=latents.device, dtype=latents.dtype).view(1, -1, 1, 1, 1)
+            mean = torch.tensor(vae.latents_mean, device=latents.device, dtype=latents.dtype).view(1, -1, 1, 1, 1)
+            std = torch.tensor(vae.latents_std, device=latents.device, dtype=latents.dtype).view(1, -1, 1, 1, 1)
             denorm = latents * std + mean
-        media = self.vae.to(latents.device).decode(denorm)
+        media = vae.to(latents.device).decode(denorm)
         return (media / 2 + 0.5).clamp(0, 1)
 
     # ------------------------------------------------------------------
@@ -289,7 +283,8 @@ class WanModel(ModelBase):
                 raise ValueError("vae_latent not found in batch "
                                  "and latents_source='data'")
             latents = raw_batch["vae_latent"]
-            latents = latents[:, :, :tc.data.num_latent_t]
+            if not self._input_latents_are_normalized:
+                latents = latents[:, :, :tc.data.num_latent_t]
             latents = latents.to(device, dtype=dtype)
         else:
             raise ValueError(f"Unknown latents_source: "
@@ -449,7 +444,17 @@ class WanModel(ModelBase):
     ) -> torch.Tensor:
         if self._input_latents_are_normalized:
             return latents
-        return normalize_dit_input("wan", latents, self.vae)
+        return normalize_dit_input("wan", latents, self.ensure_vae())
+
+    def ensure_vae(self) -> Any:
+        """Load the Wan VAE only when a runtime path actually needs it."""
+        if self.vae is None:
+            self.vae = load_module_from_path(
+                model_path=str(self.training_config.model_path),
+                module_type="vae",
+                training_config=self.training_config,
+            )
+        return self.vae
 
     def _init_timestep_mechanics(self) -> None:
         assert self.training_config is not None

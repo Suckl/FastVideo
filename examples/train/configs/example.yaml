@@ -101,7 +101,7 @@ training:
     seed: 1000                        # default: 0
     num_height: 448                   # default: 0
     num_width: 832                    # default: 0
-    num_latent_t: 20                  # default: 0
+    num_latent_t: 20                  # default: 0; ignored for vidaforge_automodel (bucket temporal size is preserved)
     num_frames: 77                    # default: 0
 
   # --- training.optimizer [TYPED] -> OptimizerConfig ---

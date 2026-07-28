@@ -240,6 +240,22 @@ def test_vidaforge_wan_validator_uses_decoded_frame_contract(decoded_frames: int
     assert validator(row) is expected
 
 
+def test_vidaforge_multibucket_validator_defers_temporal_choice_to_planner() -> None:
+    validator = VidaForgeWanDataValidator(num_frames=237, multi_bucket=True)
+    row = {
+        "caption": "caption",
+        "fps": 24.0,
+        "num_frames": 49,
+        "resolution": {
+            "width": 256,
+            "height": 144,
+        },
+    }
+
+    assert validator(row) is True
+    assert "decoded_frame_validator" not in validator.validators
+
+
 def test_vidaforge_cli_options_populate_preprocess_config():
     parser = FlexibleArgumentParser()
     PreprocessConfig.add_cli_args(parser)
@@ -684,6 +700,33 @@ def test_build_vidaforge_dataset_uses_decoded_media_metadata(tmp_path: Path):
     }
     assert row["fps"] == 25.0
     assert row["num_frames"] == 50
+    assert row["duration_sec"] == 2.04
+
+
+def test_normalize_row_preserves_manifest_duration(tmp_path: Path, monkeypatch) -> None:
+    clip_path = tmp_path / "clip.mp4"
+    clip_path.touch()
+    monkeypatch.setattr(
+        vidaforge_manifest,
+        "_probe_video",
+        lambda *_args, **_kwargs: {
+            "width": 40,
+            "height": 30,
+            "fps": 25.0,
+            "num_frames": 50,
+        },
+    )
+
+    normalized = vidaforge_manifest._normalize_row(
+        _row(clip_id="clip-a", clip_path=str(clip_path), duration_sec=2.04),
+        caption_field="caption_level_3",
+        manifest_kind=vidaforge_manifest.VidaForgeManifestKind.STAGE4,
+        data_root=None,
+        materialize_root=None,
+        video_loader_type=VideoLoaderType.TORCHVISION,
+    )
+
+    assert normalized["duration_sec"] == 2.04
 
 
 def test_build_vidaforge_stage4_defers_media_probe_until_iteration(tmp_path: Path, monkeypatch):

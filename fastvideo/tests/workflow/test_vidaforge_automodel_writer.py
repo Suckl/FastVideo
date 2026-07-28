@@ -37,7 +37,9 @@ from fastvideo.pipelines.preprocess.wan.vidaforge_stages import (
 from fastvideo.workflow.preprocess.preprocess_workflow import PreprocessWorkflow
 from fastvideo.workflow.preprocess.preprocess_workflow_vidaforge_automodel import (
     PreprocessWorkflowVidaForgeAutoModel,
+    plan_vidaforge_forward_batches,
 )
+from fastvideo.workflow.preprocess.vidaforge_bucketing import VidaForgeBucketPlanner
 
 _MODEL_NAME = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 
@@ -230,6 +232,77 @@ def test_writer_rejects_actual_geometry_outside_producer_contract(tmp_path: Path
         )
 
 
+def test_writer_validates_each_sample_against_multibucket_policy(tmp_path: Path) -> None:
+    model_root = tmp_path / "model"
+    _write_model(model_root)
+    planner = VidaForgeBucketPlanner(
+        resolution="480p",
+        upscale=False,
+        durations_sec=(2.0, 4.0),
+        temporal_stride=4,
+        input_size_multiple=16,
+        dynamic_forward_batch_size=4,
+    )
+    source_item = {
+        "clip_id": "multi-clip",
+        "video": b"video",
+        "caption": "a test caption",
+        "resolution": {
+            "width": 1920,
+            "height": 1080,
+        },
+        "fps": 16.0,
+        "num_frames": 34,
+        "duration_sec": 2.1,
+    }
+    batch = _batch("multi-clip")
+    batch.num_frames = [29]
+    batch.width = [848]
+    batch.height = [480]
+    batch.extra["source_metadata"] = [{
+        "clip_id": "multi-clip",
+        "original_filename": "safe-name",
+        "original_video_path": None,
+        "source_resolution": [1920, 1080],
+        "source_fps": 16.0,
+        "source_frame_count": 34,
+        "source_duration_sec": 2.1,
+        "caption": "a test caption",
+        "source_fingerprint": build_vidaforge_source_fingerprint(source_item),
+    }]
+    producer_config = _producer_config(
+        schema_version=2,
+        bucket_policy={
+            "mode": "multi",
+            **planner.to_producer_config(),
+        },
+    )
+    writer = _writer(
+        tmp_path / "valid-cache",
+        model_root,
+        generation="1" * 32,
+        producer_config=producer_config,
+    )
+
+    writer.save_batch(
+        batch,
+        vae=SimpleNamespace(latents_mean=[1.0, 2.0], latents_std=[2.0, 4.0]),
+    )
+
+    invalid_writer = _writer(
+        tmp_path / "invalid-cache",
+        model_root,
+        generation="2" * 32,
+        producer_config=producer_config,
+    )
+    batch.width = [832]
+    with pytest.raises(ValueError, match="actual=\\(29, 832, 480\\), expected=\\(29, 848, 480\\)"):
+        invalid_writer.save_batch(
+            batch,
+            vae=SimpleNamespace(latents_mean=[1.0, 2.0], latents_std=[2.0, 4.0]),
+        )
+
+
 def test_vidaforge_video_stage_samples_across_complete_clip() -> None:
 
     class _FrameBatch:
@@ -328,6 +401,54 @@ def test_vidaforge_video_stage_prefers_official_cuda_decode() -> None:
     )
 
     assert video.requested_frame_count == 5
+
+
+def test_vidaforge_video_stage_uses_homogeneous_dynamic_bucket() -> None:
+
+    class _Video:
+
+        def __init__(self) -> None:
+            self.requested_frame_count: int | None = None
+
+        def get_vidaforge_wan_frames(self, frame_count: int) -> torch.Tensor:
+            self.requested_frame_count = frame_count
+            return torch.zeros((frame_count, 3, 24, 48), dtype=torch.uint8)
+
+    video = _Video()
+    batch = PreprocessBatch(
+        data_type="video",
+        video_loader=[video],
+        fps=[24.0],
+        num_frames=[40],
+        height=[24],
+        width=[48],
+        extra={
+            "vidaforge_bucket": {
+                "frame_count": 9,
+                "width": 32,
+                "height": 16,
+            },
+        },
+    )
+    stage = VidaForgeWanVideoTransformStage(
+        num_frames=5,
+        max_height=16,
+        max_width=16,
+    )
+
+    result = stage.forward(
+        batch,
+        SimpleNamespace(
+            preprocess_config=SimpleNamespace(
+                video_loader_type=VideoLoaderType.TORCHCODEC, ), ),  # type: ignore[arg-type]
+    )
+
+    assert video.requested_frame_count == 9
+    assert result.latents is not None
+    assert tuple(result.latents.shape) == (1, 3, 9, 16, 32)
+    assert result.num_frames == [9]
+    assert result.width == [32]
+    assert result.height == [16]
 
 
 def test_wan_normalization_uses_official_fp16_arithmetic() -> None:
@@ -698,6 +819,155 @@ def test_publish_merges_distributed_rank_progress(tmp_path: Path) -> None:
         "clip-rank-0",
         "clip-rank-1",
     }
+
+
+def test_publish_rejects_failure_followed_by_success_on_another_rank(tmp_path: Path) -> None:
+    model_root = tmp_path / "model"
+    output_dir = tmp_path / "cache"
+    _write_model(model_root)
+    generation = "9" * 32
+    writers = [
+        VidaForgeAutoModelWriter(
+            output_dir,
+            model_root=model_root,
+            model_name=_MODEL_NAME,
+            requested_revision="1" * 40,
+            producer_config=_producer_config(),
+            samples_per_shard=1,
+            resume=False,
+            rank=rank,
+            world_size=2,
+            generation=generation,
+        ) for rank in range(2)
+    ]
+    source = _source_item("conflicting-clip")
+    writers[0].record_failure(source, stage="encoding", error="decoder failed")
+    writers[1].save_batch(
+        _batch("conflicting-clip"),
+        vae=SimpleNamespace(latents_mean=[1.0, 2.0], latents_std=[2.0, 4.0]),
+    )
+    for writer in writers:
+        writer.write_rank_progress()
+
+    with pytest.raises(ValueError, match="both successful and failed"):
+        writers[0].publish()
+
+
+def test_publish_reports_recoverable_failures_and_bucket_counts(tmp_path: Path) -> None:
+    model_root = tmp_path / "model"
+    output_dir = tmp_path / "cache"
+    _write_model(model_root)
+    writer = _writer(output_dir, model_root, generation="f" * 32)
+    failed_item = _source_item("failed-clip")
+    assert writer.pending_items([failed_item]) == [failed_item]
+    writer.record_failure(failed_item, stage="bucket_planning", error=ValueError("too short"))
+    writer.save_batch(
+        _batch("encoded-clip"),
+        vae=SimpleNamespace(latents_mean=[1.0, 2.0], latents_std=[2.0, 4.0]),
+    )
+
+    writer.write_rank_progress()
+    assert writer.publish() == 1
+
+    summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    failures = json.loads((output_dir / "failures.json").read_text(encoding="utf-8"))
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert summary == {
+        "schema_version": 1,
+        "format": "vidaforge_automodel",
+        "input_count": 2,
+        "ok_count": 1,
+        "failed_count": 1,
+        "bucket_counts": {
+            "1f/16x16": 1,
+        },
+        "failure_stage_counts": {
+            "bucket_planning": 1,
+        },
+    }
+    assert failures[0]["clip_id"] == "failed-clip"
+    assert failures[0]["error"] == "too short"
+    assert metadata["summary_file"] == "summary.json"
+    assert metadata["failures_file"] == "failures.json"
+
+
+def test_publish_keeps_failure_diagnostics_when_no_cache_item_succeeds(tmp_path: Path) -> None:
+    model_root = tmp_path / "model"
+    output_dir = tmp_path / "cache"
+    _write_model(model_root)
+    writer = _writer(output_dir, model_root, generation="0" * 32)
+    failed_item = _source_item("only-failure")
+    assert writer.pending_items([failed_item]) == [failed_item]
+    writer.record_failure(failed_item, stage="encoding", error="decoder failed")
+
+    writer.write_rank_progress()
+    assert writer.publish() == 0
+
+    summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert summary["ok_count"] == 0
+    assert summary["failed_count"] == 1
+    assert metadata["shards"] == []
+
+
+def test_multibucket_planning_groups_shapes_scales_batches_and_reports_short_clips() -> None:
+    planner = VidaForgeBucketPlanner(
+        resolution="480p",
+        upscale=False,
+        durations_sec=(2.0, 4.0),
+        temporal_stride=4,
+        input_size_multiple=16,
+        dynamic_forward_batch_size=4,
+    )
+    items = [{
+        "clip_id": f"landscape-{index}",
+        "duration_sec": 4.1,
+        "fps": 16.0,
+        "resolution": {
+            "width": 1920,
+            "height": 1080,
+        },
+    } for index in range(6)]
+    items.extend([
+        {
+            "clip_id": "portrait",
+            "duration_sec": 2.1,
+            "fps": 16.0,
+            "resolution": {
+                "width": 1080,
+                "height": 1920,
+            },
+        },
+        {
+            "clip_id": "too-short",
+            "duration_sec": 1.0,
+            "fps": 16.0,
+            "resolution": {
+                "width": 1920,
+                "height": 1080,
+            },
+        },
+    ])
+
+    batches, failures = plan_vidaforge_forward_batches(items, planner)
+
+    assert [len(batch) for batch in batches] == [4, 2, 1]
+    assert {
+        tuple(item["_vidaforge_bucket"].values())
+        for batch in batches
+        for item in batch
+    } == {
+        (61, 848, 480),
+        (29, 480, 848),
+    }
+    assert all(
+        len({
+            tuple(item["_vidaforge_bucket"].values())
+            for item in batch
+        }) == 1 for batch in batches)
+    assert len(failures) == 1
+    assert failures[0][0]["clip_id"] == "too-short"
+    assert "shorter than the smallest temporal bucket" in str(failures[0][1])
 
 
 def test_vidaforge_automodel_config_requires_deterministic_wan_geometry() -> None:

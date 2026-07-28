@@ -97,50 +97,82 @@ class VidaForgeWanVideoTransformStage(PipelineStage):
         if not preprocess_batch.video_loader:
             raise ValueError("Video loader is not set")
 
+        num_frames, target_height, target_width = self._target_geometry(preprocess_batch)
         videos: list[torch.Tensor] = []
         for loader in preprocess_batch.video_loader:
             if fastvideo_args.preprocess_config.video_loader_type == VideoLoaderType.TORCHCODEC:
                 official_decode = getattr(loader, "get_vidaforge_wan_frames", None)
                 if callable(official_decode):
-                    video = official_decode(self.num_frames)
+                    video = official_decode(num_frames)
                 else:
-                    frame_indices = self._frame_indices(len(loader))
+                    frame_indices = self._frame_indices(len(loader), num_frames=num_frames)
                     video = loader.get_frames_at(frame_indices).data
             elif fastvideo_args.preprocess_config.video_loader_type == VideoLoaderType.TORCHVISION:
                 video, _, _ = torchvision.io.read_video(loader, output_format="TCHW")
-                frame_indices = self._frame_indices(int(video.shape[0]))
+                frame_indices = self._frame_indices(int(video.shape[0]), num_frames=num_frames)
                 video = video[frame_indices]
             else:
                 raise ValueError(f"Invalid video loader type: {fastvideo_args.preprocess_config.video_loader_type}")
-            videos.append(self._center_crop_resize(video))
+            videos.append(self._center_crop_resize(
+                video,
+                target_height=target_height,
+                target_width=target_width,
+            ))
 
         pixel_values = rearrange(torch.stack(videos), "b t c h w -> b c t h w")
         preprocess_batch.latents = pixel_values.float() / 255.0
         batch_size = len(videos)
-        preprocess_batch.num_frames = [self.num_frames] * batch_size
-        preprocess_batch.height = [self.max_height] * batch_size
-        preprocess_batch.width = [self.max_width] * batch_size
+        preprocess_batch.num_frames = [num_frames] * batch_size
+        preprocess_batch.height = [target_height] * batch_size
+        preprocess_batch.width = [target_width] * batch_size
         return preprocess_batch
 
-    def _frame_indices(self, input_frame_count: int) -> list[int]:
+    def _target_geometry(self, batch: PreprocessBatch) -> tuple[int, int, int]:
+        bucket = batch.extra.get("vidaforge_bucket")
+        if bucket is None:
+            return self.num_frames, self.max_height, self.max_width
+        if not isinstance(bucket, dict):
+            raise ValueError("VidaForge bucket assignment must be a mapping")
+        try:
+            num_frames = int(bucket["frame_count"])
+            target_width = int(bucket["width"])
+            target_height = int(bucket["height"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"VidaForge bucket assignment is invalid: {bucket!r}") from exc
+        if (num_frames <= 0 or (num_frames - 1) % 4 != 0 or target_width <= 0 or target_height <= 0 or target_width % 16
+                or target_height % 16):
+            raise ValueError(f"VidaForge Wan bucket geometry is invalid: {bucket!r}")
+        return num_frames, target_height, target_width
+
+    def _frame_indices(self, input_frame_count: int, *, num_frames: int | None = None) -> list[int]:
+        target_frame_count = self.num_frames if num_frames is None else int(num_frames)
         if (input_frame_count <= 0
-                or self.num_frames - input_frame_count > VIDAFORGE_WAN_MAX_TEMPORAL_REPEAT_PAD_FRAMES):
-            raise ValueError(f"VidaForge producer requires at least "
-                             f"{self.num_frames - VIDAFORGE_WAN_MAX_TEMPORAL_REPEAT_PAD_FRAMES} decoded frames for a "
-                             f"{self.num_frames}-frame bucket, got {input_frame_count}")
+                or target_frame_count - input_frame_count > VIDAFORGE_WAN_MAX_TEMPORAL_REPEAT_PAD_FRAMES):
+            raise ValueError(
+                f"VidaForge producer requires at least "
+                f"{target_frame_count - VIDAFORGE_WAN_MAX_TEMPORAL_REPEAT_PAD_FRAMES} decoded frames for a "
+                f"{target_frame_count}-frame bucket, got {input_frame_count}")
         return (torch.linspace(
             0,
             input_frame_count - 1,
-            steps=self.num_frames,
+            steps=target_frame_count,
             dtype=torch.float64,
         ).round().to(dtype=torch.int64).tolist())
 
-    def _center_crop_resize(self, video: torch.Tensor) -> torch.Tensor:
+    def _center_crop_resize(
+        self,
+        video: torch.Tensor,
+        *,
+        target_height: int | None = None,
+        target_width: int | None = None,
+    ) -> torch.Tensor:
         if video.ndim != 4 or video.shape[1] != 3:
             raise ValueError(f"Expected decoded video in TCHW format, got {tuple(video.shape)}")
+        output_height = self.max_height if target_height is None else int(target_height)
+        output_width = self.max_width if target_width is None else int(target_width)
         source_height, source_width = int(video.shape[-2]), int(video.shape[-1])
         source_ratio = source_width / source_height
-        target_ratio = self.max_width / self.max_height
+        target_ratio = output_width / output_height
         if source_ratio > target_ratio:
             crop_height = source_height
             crop_width = max(1, int(math.floor(source_height * target_ratio)))
@@ -154,7 +186,7 @@ class VidaForgeWanVideoTransformStage(PipelineStage):
         cropped = video[..., top:top + crop_height, left:left + crop_width]
         return F.interpolate(
             cropped.float(),
-            size=(self.max_height, self.max_width),
+            size=(output_height, output_width),
             mode="bilinear",
             align_corners=False,
         )

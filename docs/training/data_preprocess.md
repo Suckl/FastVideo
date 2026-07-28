@@ -272,35 +272,54 @@ torchrun --nproc_per_node=1 \
     --preprocess.vidaforge-model-name \
         "Wan-AI/Wan2.1-T2V-1.3B-Diffusers" \
     --preprocess.dataset-output-dir "/data/vidaforge-stage5" \
-    --preprocess.max-height 144 \
-    --preprocess.max-width 256 \
-    --preprocess.num-frames 17 \
-    --preprocess.train-fps 16 \
+    --preprocess.vidaforge-bucket-resolution 480p \
+    --preprocess.vidaforge-bucket-durations-sec 2 3 4 5 6 8 10 \
+    --preprocess.vidaforge-dynamic-forward-batch-size 4 \
+    --preprocess.preprocess-video-batch-size 32 \
     --preprocess.samples-per-file 256
 ```
 
-This producer currently supports Wan text-to-video caches. The frame count
-must be `4n+1`, both spatial dimensions must be divisible by 16,
+The multi-bucket options reproduce the Stage 5 policy pinned at VidaForge
+revision `4562d3f`. For each clip, FastVideo:
+
+1. chooses the largest configured duration that fits `duration_sec * fps` and
+   rounds its frame count down to Wan's `4n+1` contract;
+2. preserves the source aspect ratio under the selected pixel budget, with
+   width and height aligned down to 16;
+3. groups equal `(frames, width, height)` samples; and
+4. scales each encoder sub-batch inversely with `frames * width * height`.
+
+The default is no spatial upscaling. Add
+`--preprocess.vidaforge-bucket-upscale` only when upscaling is intentional.
+Leaving `vidaforge_bucket_resolution` empty retains the earlier fixed-geometry
+mode, where `num_frames` must be `4n+1` and `max_height`/`max_width` must be
+divisible by 16.
+
+This producer currently supports Wan text-to-video caches.
 `training_cfg_rate` must be zero, and temporal random sampling must be
 disabled. It uses VidaForge's full-clip linspace sampling, prompt cleanup,
 CUDA beta exact-seek TorchCodec decoding, center crop, and fp16 VAE/bf16 UMT5
 precisions. Torchvision is not accepted for this parity output. CFG dropout
-remains a per-epoch training decision in the Section 2 loader rather than being
+remains a per-epoch training decision in the loader rather than being
 permanently baked into cached text embeddings. As in VidaForge, a clip may be
 at most three decoded frames short; linspace repeats boundary-near samples to
-fill the `4n+1` bucket. Shorter inputs are rejected.
+fill the selected `4n+1` bucket. Shorter inputs are reported as failures.
 
-The output contains `provenance.json`, `metadata.json`, metadata shards, and
-one atomic `.meta` file per clip. `provenance.json` records the resolved model
-revision plus the path and SHA-256 of every VAE/text-encoder weight and
-configuration file. Copy its `vae_fingerprint` and
+The output contains `provenance.json`, `metadata.json`, `summary.json`,
+`failures.json`, metadata shards, and one atomic `.meta` file per successful
+clip. `summary.json` reports successful/failed counts and the distribution of
+published buckets; `failures.json` records recoverable planning or encoding
+errors by clip ID. `provenance.json` records the
+resolved model revision plus the path and SHA-256 of every VAE/text-encoder
+weight and configuration file. Copy its `vae_fingerprint` and
 `text_encoder_fingerprint` values into the training configuration below.
 Tokenizer files, including `spiece.model`, are included in the text-encoder
 identity because they also affect the resulting embeddings. The same file
 records a `producer_config_fingerprint` over output-affecting settings such as
-resolution, frame count, FPS, caption field, selection, manifest content,
-component precision, and tokenizer sequence length. Each item also records a
-fingerprint over its cleaned caption, media bytes, and decoded source metadata.
+fixed geometry or the complete multi-bucket policy, FPS, caption field,
+selection, manifest content, component precision, and tokenizer sequence
+length. Each item also records a fingerprint over its cleaned caption, media
+bytes, Stage 4 duration, and decoded source metadata.
 
 Interrupted runs do not publish partial `.meta` files. To continue a
 previously published compatible cache, add
@@ -323,9 +342,6 @@ training:
     dataloader_num_workers: 4
     training_cfg_rate: 0.0
     seed: 42
-    num_height: 144
-    num_width: 256
-    num_latent_t: 5
 ```
 
 The loader keeps each batch within one VidaForge temporal/resolution/latent
@@ -337,8 +353,15 @@ dtype.
 
 VidaForge's Wan Stage 5 encoder has already applied the VAE latent mean/std
 normalization. FastVideo marks this data type explicitly and does not normalize
-those latents a second time. Regular FastVideo `t2v` Parquet inputs retain the
-existing runtime normalization.
+those latents a second time. It also preserves each cache bucket's complete
+temporal latent instead of truncating it to the global `num_latent_t` setting.
+Regular FastVideo `t2v` Parquet inputs retain the existing runtime
+normalization and temporal truncation.
+
+Pre-encoded fine-tuning does not load the VAE or construct an unused negative
+prompt embedding. The VAE is loaded lazily only if a later path explicitly
+decodes latents. Methods that perform unconditional forwards can still request
+negative conditioning.
 
 The Stage 5 cache must use `model_type: wan`. FastVideo compares `model_name`
 exactly with `vidaforge_model_name`, or with `training.model_path` when the
@@ -413,6 +436,25 @@ Run this gate after any change to the native producer, its Wan preprocessing
 stages, or component precision. The earlier
 `test_vidaforge_automodel_official.py` gate proves that FastVideo can read an
 officially produced payload; it does not exercise FastVideo's producer.
+
+The Section 4 end-to-end gate uses two pinned VidaForge-3M clips that resolve
+to different temporal and spatial buckets. It checks both caches against the
+pinned VidaForge encoder, then performs a real Wan 1.3B
+forward/loss/backward/optimizer step from the generated cache and verifies
+model, optimizer, and dataloader checkpoint resume:
+
+```bash
+VIDAFORGE_RUN_MULTIBUCKET_TRAINING_INTEGRATION=1 \
+VIDAFORGE_REFERENCE_DIR=/tmp/VidaForge \
+pytest \
+    fastvideo/tests/workflow/test_vidaforge_multibucket_training_integration.py \
+    -vs
+```
+
+This gate is sized for one Modal L40S. It freezes the Wan backbone except for
+the output projection so that the test exercises the real training and
+checkpoint paths without turning an integration gate into a full fine-tuning
+job.
 
 ## Creating Your Own Dataset
 

@@ -36,7 +36,10 @@ class PreprocessWorkflow(WorkflowBase):
 
         # raw data validator
         if preprocess_config.output_type == PreprocessOutputType.VIDAFORGE_AUTOMODEL:
-            raw_data_validator = VidaForgeWanDataValidator(num_frames=preprocess_config.num_frames)
+            raw_data_validator = VidaForgeWanDataValidator(
+                num_frames=preprocess_config.num_frames,
+                multi_bucket=bool(preprocess_config.vidaforge_bucket_resolution.strip()),
+            )
         else:
             raw_data_validator = PreprocessingDataValidator(
                 max_height=preprocess_config.max_height,

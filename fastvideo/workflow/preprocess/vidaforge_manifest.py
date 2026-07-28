@@ -498,7 +498,7 @@ def _normalize_row(
     _positive_number(row, "width")
     _positive_number(row, "height")
     manifest_fps = _positive_number(row, "fps")
-    _positive_number(row, "duration_sec")
+    source_duration_sec = _positive_number(row, "duration_sec")
 
     if manifest_kind == VidaForgeManifestKind.STAGE4:
         clip_path = _resolve_stage4_clip_path(row, data_root)
@@ -533,6 +533,10 @@ def _normalize_row(
         },
         "fps": media["fps"],
         "num_frames": media["num_frames"],
+        # VidaForge Stage 5 chooses its temporal bucket from the Stage 4
+        # duration contract rather than from the decoder's best-effort frame
+        # count. Preserve it alongside the probed media metadata.
+        "duration_sec": source_duration_sec,
         "caption": str(row[caption_field]).strip(),
     }
 

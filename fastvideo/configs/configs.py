@@ -1,4 +1,5 @@
 import dataclasses
+import math
 from enum import Enum
 from typing import Any, Optional
 
@@ -7,6 +8,21 @@ from fastvideo.logger import init_logger
 from fastvideo.utils import FlexibleArgumentParser, StoreBoolean
 
 logger = init_logger(__name__)
+
+VIDAFORGE_DEFAULT_BUCKET_DURATIONS_SEC = (2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0)
+
+
+def _normalize_vidaforge_bucket_durations(value: Any) -> tuple[float, ...]:
+    if isinstance(value, str | bytes):
+        raise ValueError("vidaforge_bucket_durations_sec must be a sequence of numbers")
+    try:
+        durations = (float(item) for item in value)
+        # The upstream algorithm sorts and de-duplicates derived frame counts.
+        # Canonicalizing exact duration duplicates here also keeps provenance
+        # stable for semantically equivalent CLI input.
+        return tuple(sorted(set(durations)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("vidaforge_bucket_durations_sec must be a sequence of numbers") from exc
 
 
 class DatasetType(str, Enum):
@@ -89,6 +105,10 @@ class PreprocessConfig:
     output_type: PreprocessOutputType = PreprocessOutputType.PARQUET
     vidaforge_model_name: str = ""
     vidaforge_resume: bool = False
+    vidaforge_bucket_resolution: str = ""
+    vidaforge_bucket_upscale: bool = False
+    vidaforge_bucket_durations_sec: tuple[float, ...] = VIDAFORGE_DEFAULT_BUCKET_DURATIONS_SEC
+    vidaforge_dynamic_forward_batch_size: int = 4
 
     # Dataloader configuration
     dataloader_num_workers: int = 1
@@ -115,6 +135,9 @@ class PreprocessConfig:
 
     # framework configuration
     seed: int = 42
+
+    def __post_init__(self) -> None:
+        self.vidaforge_bucket_durations_sec = _normalize_vidaforge_bucket_durations(self.vidaforge_bucket_durations_sec)
 
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser, prefix: str = "preprocess") -> FlexibleArgumentParser:
@@ -172,6 +195,26 @@ class PreprocessConfig:
                                      action=StoreBoolean,
                                      default=PreprocessConfig.vidaforge_resume,
                                      help="Resume a compatible VidaForge AutoModel cache and skip completed clip IDs.")
+        preprocess_args.add_argument(
+            f"--{prefix_with_dot}vidaforge-bucket-resolution",
+            type=str,
+            default=PreprocessConfig.vidaforge_bucket_resolution,
+            help="Enable VidaForge multi-bucket output with a pixel budget such as 480p; empty keeps fixed geometry.")
+        preprocess_args.add_argument(f"--{prefix_with_dot}vidaforge-bucket-upscale",
+                                     action=StoreBoolean,
+                                     default=PreprocessConfig.vidaforge_bucket_upscale,
+                                     help="Allow VidaForge spatial buckets to upscale source videos.")
+        preprocess_args.add_argument(
+            f"--{prefix_with_dot}vidaforge-bucket-durations-sec",
+            type=float,
+            nargs="+",
+            default=PreprocessConfig.vidaforge_bucket_durations_sec,
+            help="VidaForge temporal bucket durations; values are sorted and exact duplicates are removed.")
+        preprocess_args.add_argument(
+            f"--{prefix_with_dot}vidaforge-dynamic-forward-batch-size",
+            type=int,
+            default=PreprocessConfig.vidaforge_dynamic_forward_batch_size,
+            help="Reference encoder batch size scaled by each VidaForge bucket's spatiotemporal cost.")
 
         # Dataloader
         preprocess_args.add_argument(
@@ -269,6 +312,9 @@ class PreprocessConfig:
             preprocess_config.video_loader_type = VideoLoaderType.from_string(preprocess_config.video_loader_type)
         if isinstance(preprocess_config.output_type, str):
             preprocess_config.output_type = PreprocessOutputType.from_string(preprocess_config.output_type)
+        preprocess_config.vidaforge_bucket_resolution = preprocess_config.vidaforge_bucket_resolution.strip().lower()
+        preprocess_config.vidaforge_bucket_durations_sec = _normalize_vidaforge_bucket_durations(
+            preprocess_config.vidaforge_bucket_durations_sec)
         return preprocess_config
 
     def check_preprocess_config(self) -> None:
@@ -296,10 +342,35 @@ class PreprocessConfig:
             if self.drop_short_ratio != 1.0:
                 raise ValueError("vidaforge_automodel output requires drop_short_ratio=1 "
                                  "so short clips cannot create undersized Wan buckets")
-            if self.num_frames <= 0 or (self.num_frames - 1) % 4 != 0:
-                raise ValueError("Wan vidaforge_automodel output requires num_frames=4n+1")
-            if self.max_height <= 0 or self.max_width <= 0 or self.max_height % 16 or self.max_width % 16:
-                raise ValueError("Wan vidaforge_automodel output requires max_height/max_width divisible by 16")
+            if not isinstance(self.vidaforge_bucket_resolution, str):
+                raise ValueError("vidaforge_bucket_resolution must be a string")
+            bucket_resolution = self.vidaforge_bucket_resolution.strip().lower()
+            if bucket_resolution:
+                if not bucket_resolution.endswith("p"):
+                    raise ValueError("vidaforge_bucket_resolution must look like '480p'")
+                try:
+                    reference_height = int(bucket_resolution[:-1])
+                except ValueError as exc:
+                    raise ValueError("vidaforge_bucket_resolution must look like '480p'") from exc
+                if reference_height <= 0:
+                    raise ValueError("vidaforge_bucket_resolution height must be greater than 0")
+                self.vidaforge_bucket_resolution = bucket_resolution
+                self.vidaforge_bucket_durations_sec = _normalize_vidaforge_bucket_durations(
+                    self.vidaforge_bucket_durations_sec)
+                if not self.vidaforge_bucket_durations_sec:
+                    raise ValueError("vidaforge_bucket_durations_sec must not be empty")
+                if any(duration <= 0 or not math.isfinite(duration)
+                       for duration in self.vidaforge_bucket_durations_sec):
+                    raise ValueError("vidaforge_bucket_durations_sec values must be finite and greater than 0")
+                if not isinstance(self.vidaforge_bucket_upscale, bool):
+                    raise ValueError("vidaforge_bucket_upscale must be a bool")
+                if self.vidaforge_dynamic_forward_batch_size <= 0:
+                    raise ValueError("vidaforge_dynamic_forward_batch_size must be greater than 0")
+            else:
+                if self.num_frames <= 0 or (self.num_frames - 1) % 4 != 0:
+                    raise ValueError("Wan vidaforge_automodel output requires num_frames=4n+1")
+                if self.max_height <= 0 or self.max_width <= 0 or self.max_height % 16 or self.max_width % 16:
+                    raise ValueError("Wan vidaforge_automodel output requires max_height/max_width divisible by 16")
         if self.samples_per_file <= 0:
             raise ValueError("samples_per_file must be greater than 0")
         if self.flush_frequency <= 0:

@@ -109,13 +109,15 @@ class PreprocessingDataValidator:
 class VidaForgeWanDataValidator(PreprocessingDataValidator):
     """Validate the decoded-frame contract used by VidaForge's Wan producer."""
 
-    def __init__(self, *, num_frames: int) -> None:
+    def __init__(self, *, num_frames: int, multi_bucket: bool = False) -> None:
+        self.multi_bucket = bool(multi_bucket)
         super().__init__(num_frames=num_frames)
 
     def register_validators(self) -> None:
         self.add_validator("data_type_validator", self._validate_data_type)
         self.add_validator("resolution_validator", self._validate_resolution)
-        self.add_validator("decoded_frame_validator", self._validate_decoded_frame_count)
+        if not self.multi_bucket:
+            self.add_validator("decoded_frame_validator", self._validate_decoded_frame_count)
 
     def _validate_decoded_frame_count(self, batch: dict[str, Any]) -> bool:
         from fastvideo.workflow.preprocess.vidaforge_manifest import (
@@ -130,6 +132,18 @@ class VideoForwardBatchBuilder:
         self.seed = seed
 
     def __call__(self, batch: list) -> PreprocessBatch:
+        source_durations = [
+            float(item["duration_sec"]) if item.get("duration_sec") is not None else float(item["num_frames"]) /
+            float(item["fps"]) for item in batch
+        ]
+        bucket_values = [item.get("_vidaforge_bucket") for item in batch]
+        if any(value is not None for value in bucket_values):
+            if not all(isinstance(value, dict) for value in bucket_values):
+                raise ValueError("VidaForge forward batch has incomplete bucket assignments")
+            first_bucket = bucket_values[0]
+            if any(value != first_bucket for value in bucket_values[1:]):
+                raise ValueError("VidaForge forward batch must contain one homogeneous bucket")
+
         forward_batch = PreprocessBatch(
             video_loader=[item["video"] for item in batch],
             video_file_name=[item["name"] for item in batch],
@@ -157,11 +171,15 @@ class VideoForwardBatchBuilder:
             float(item["fps"]),
             "source_frame_count":
             int(item["num_frames"]),
+            "source_duration_sec":
+            source_durations[index],
             "caption":
             str(item["caption"]),
             "source_fingerprint":
             item.get("_vidaforge_source_fingerprint"),
-        } for item in batch]
+        } for index, item in enumerate(batch)]
+        if bucket_values and bucket_values[0] is not None:
+            forward_batch.extra["vidaforge_bucket"] = dict(bucket_values[0])
         return forward_batch
 
 

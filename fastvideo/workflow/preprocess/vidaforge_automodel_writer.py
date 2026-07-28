@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -173,6 +174,11 @@ def build_vidaforge_source_fingerprint(item: dict[str, Any]) -> str:
     resolution = item.get("resolution")
     if not isinstance(resolution, dict):
         raise ValueError(f"VidaForge producer input resolution is invalid for {clip_id!r}")
+    source_fps = float(item.get("fps", 0))
+    source_frame_count = int(item.get("num_frames", 0))
+    source_duration = item.get("duration_sec")
+    source_duration_sec = (float(source_duration) if source_duration is not None else source_frame_count /
+                           source_fps if source_fps > 0 else 0.0)
     identity = {
         "schema_version": 1,
         "clip_id": clip_id,
@@ -182,11 +188,13 @@ def build_vidaforge_source_fingerprint(item: dict[str, Any]) -> str:
             int(resolution.get("width", 0)),
             int(resolution.get("height", 0)),
         ],
-        "source_fps": float(item.get("fps", 0)),
-        "source_frame_count": int(item.get("num_frames", 0)),
+        "source_fps": source_fps,
+        "source_frame_count": source_frame_count,
+        "source_duration_sec": source_duration_sec,
     }
     if (not clip_id or not identity["caption"] or min(identity["source_resolution"]) <= 0 or identity["source_fps"] <= 0
-            or identity["source_frame_count"] <= 0):
+            or identity["source_frame_count"] <= 0 or identity["source_duration_sec"] <= 0
+            or not math.isfinite(identity["source_duration_sec"])):
         raise ValueError(f"VidaForge producer input identity is incomplete for {clip_id!r}")
     return hashlib.sha256(_canonical_json(identity)).hexdigest()
 
@@ -285,10 +293,15 @@ class VidaForgeAutoModelWriter:
         self._existing_items = self._load_existing_items(resume=resume)
         self._retained_items: dict[str, dict[str, Any]] = {}
         self._new_items: dict[str, dict[str, Any]] = {}
+        self._failures: dict[str, dict[str, Any]] = {}
 
     @property
     def completed_count(self) -> int:
         return len(self._existing_items) + len(self._new_items)
+
+    @property
+    def failure_count(self) -> int:
+        return len(self._failures)
 
     def pending_items(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         pending: list[dict[str, Any]] = []
@@ -314,6 +327,26 @@ class VidaForgeAutoModelWriter:
                 pending.append(item)
         return pending
 
+    def record_failure(self, item: dict[str, Any], *, stage: str, error: BaseException | str) -> None:
+        """Record one recoverable source failure for the published diagnostics."""
+        clip_id = str(item.get("clip_id", "")).strip()
+        if not clip_id:
+            raise ValueError("Cannot record a VidaForge producer failure without clip_id")
+        if clip_id in self._new_items:
+            raise ValueError(f"Cannot mark an already encoded VidaForge clip as failed: {clip_id!r}")
+        source_fingerprint = str(item.get("_vidaforge_source_fingerprint", ""))
+        if not re.fullmatch(r"[0-9a-f]{64}", source_fingerprint):
+            source_fingerprint = build_vidaforge_source_fingerprint(item)
+        message = str(error).strip()
+        if not message:
+            message = error.__class__.__name__ if isinstance(error, BaseException) else "unknown error"
+        self._failures[clip_id] = {
+            "clip_id": clip_id,
+            "stage": str(stage).strip() or "unknown",
+            "error": message[:2000],
+            "source_fingerprint": source_fingerprint,
+        }
+
     def save_batch(self, batch: PreprocessBatch, *, vae: Any) -> None:
         if not isinstance(batch.latents, torch.Tensor) or batch.latents.ndim != 5:
             raise ValueError("VidaForge producer requires batched 5D VAE latents")
@@ -335,11 +368,7 @@ class VidaForgeAutoModelWriter:
             width = int(batch.width[index])
             height = int(batch.height[index])
             frame_count = int(batch.num_frames[index])
-            expected_geometry = (
-                int(self.producer_config["num_frames"]),
-                int(self.producer_config["max_width"]),
-                int(self.producer_config["max_height"]),
-            )
+            expected_geometry = self._expected_geometry(source)
             actual_geometry = (frame_count, width, height)
             if actual_geometry != expected_geometry or (frame_count - 1) % 4 != 0:
                 raise ValueError(
@@ -355,6 +384,55 @@ class VidaForgeAutoModelWriter:
                 height=height,
                 frame_count=frame_count,
             )
+
+    def _expected_geometry(self, source: dict[str, Any]) -> tuple[int, int, int]:
+        bucket_policy = self.producer_config.get("bucket_policy")
+        if bucket_policy is None:
+            return (
+                int(self.producer_config["num_frames"]),
+                int(self.producer_config["max_width"]),
+                int(self.producer_config["max_height"]),
+            )
+        if not isinstance(bucket_policy, dict):
+            raise ValueError("VidaForge producer bucket_policy must be a mapping")
+        mode = str(bucket_policy.get("mode", "")).strip()
+        if mode == "fixed":
+            return (
+                int(bucket_policy["frame_count"]),
+                int(bucket_policy["width"]),
+                int(bucket_policy["height"]),
+            )
+        if mode != "multi":
+            raise ValueError(f"Unsupported VidaForge producer bucket mode: {mode!r}")
+
+        from fastvideo.workflow.preprocess.vidaforge_bucketing import (
+            VIDAFORGE_BUCKETING_REFERENCE_REVISION,
+            VidaForgeBucketPlanner,
+        )
+
+        if bucket_policy.get("reference_revision") != VIDAFORGE_BUCKETING_REFERENCE_REVISION:
+            raise ValueError("VidaForge producer bucket policy has an unsupported reference revision")
+        planner = VidaForgeBucketPlanner(
+            resolution=str(bucket_policy["resolution"]),
+            upscale=bool(bucket_policy["upscale"]),
+            durations_sec=tuple(float(value) for value in bucket_policy["durations_sec"]),
+            temporal_stride=int(bucket_policy["temporal_stride"]),
+            input_size_multiple=int(bucket_policy["input_size_multiple"]),
+            dynamic_forward_batch_size=int(bucket_policy["dynamic_forward_batch_size"]),
+        )
+        source_fps = float(source["source_fps"])
+        source_frame_count = int(source["source_frame_count"])
+        source_duration_sec = float(source.get("source_duration_sec", source_frame_count / source_fps))
+        source_resolution = source["source_resolution"]
+        expected = planner.bucket_for_item({
+            "duration_sec": source_duration_sec,
+            "fps": source_fps,
+            "resolution": {
+                "width": int(source_resolution[0]),
+                "height": int(source_resolution[1]),
+            },
+        })
+        return expected.key
 
     def _save_sample(
         self,
@@ -395,26 +473,48 @@ class VidaForgeAutoModelWriter:
             pad_short=True,
         )
         metadata = {
-            "producer": "fastvideo",
-            "model_type": "wan",
-            "model_name": self.model_name,
-            "model_revision": self.provenance["model_revision"],
-            "vae_fingerprint": self.provenance["vae_fingerprint"],
-            "text_encoder_fingerprint": self.provenance["text_encoder_fingerprint"],
-            "producer_config_fingerprint": self.provenance["producer_config_fingerprint"],
-            "source_fingerprint": source_fingerprint,
-            "clip_id": clip_id,
-            "caption": str(source["caption"]),
-            "caption_field": self.producer_config["caption_field"],
+            "producer":
+            "fastvideo",
+            "model_type":
+            "wan",
+            "model_name":
+            self.model_name,
+            "model_revision":
+            self.provenance["model_revision"],
+            "vae_fingerprint":
+            self.provenance["vae_fingerprint"],
+            "text_encoder_fingerprint":
+            self.provenance["text_encoder_fingerprint"],
+            "producer_config_fingerprint":
+            self.provenance["producer_config_fingerprint"],
+            "source_fingerprint":
+            source_fingerprint,
+            "clip_id":
+            clip_id,
+            "caption":
+            str(source["caption"]),
+            "caption_field":
+            self.producer_config["caption_field"],
             "bucket_resolution": [width, height],
-            "bucket_frame_count": frame_count,
-            "caption_token_length": caption_token_length,
-            "caption_token_max_length": sequence_length,
-            "caption_token_truncated": caption_token_length > sequence_length,
-            "source_resolution": list(source["source_resolution"]),
-            "source_fps": float(source["source_fps"]),
-            "source_frame_count": int(source["source_frame_count"]),
-            "latent_shape": list(latent_cpu.shape),
+            "bucket_frame_count":
+            frame_count,
+            "caption_token_length":
+            caption_token_length,
+            "caption_token_max_length":
+            sequence_length,
+            "caption_token_truncated":
+            caption_token_length > sequence_length,
+            "source_resolution":
+            list(source["source_resolution"]),
+            "source_fps":
+            float(source["source_fps"]),
+            "source_frame_count":
+            int(source["source_frame_count"]),
+            "source_duration_sec":
+            float(source.get("source_duration_sec",
+                             int(source["source_frame_count"]) / float(source["source_fps"]))),
+            "latent_shape":
+            list(latent_cpu.shape),
         }
         payload = {
             "video_latents": latent_cpu,
@@ -428,6 +528,7 @@ class VidaForgeAutoModelWriter:
         }
         _atomic_torch_save(path, payload)
         relative_posix = relative_path.as_posix()
+        self._failures.pop(clip_id, None)
         self._new_items[clip_id] = {
             "cache_file": relative_posix,
             "bucket_resolution": [width, height],
@@ -446,6 +547,8 @@ class VidaForgeAutoModelWriter:
         current_items = dict(self._retained_items)
         current_items.update(self._new_items)
         _atomic_json(path, list(current_items.values()))
+        failure_path = self.output_dir / ".vidaforge_progress" / f"{self.generation}-rank-{self.rank:05d}-failures.json"
+        _atomic_json(failure_path, [self._failures[key] for key in sorted(self._failures)])
         return path
 
     def publish(self) -> int:
@@ -453,6 +556,7 @@ class VidaForgeAutoModelWriter:
         if self.rank != 0:
             raise RuntimeError("Only rank zero may publish VidaForge metadata")
         items_by_clip: dict[str, dict[str, Any]] = {}
+        failures_by_clip: dict[str, dict[str, Any]] = {}
         progress_dir = self.output_dir / ".vidaforge_progress"
         for rank in range(self.world_size):
             path = progress_dir / f"{self.generation}-rank-{rank:05d}.json"
@@ -466,13 +570,33 @@ class VidaForgeAutoModelWriter:
                     raise ValueError(f"Invalid VidaForge rank progress item: {path}")
                 self._validate_item(item, where=path)
                 clip_id = str(item.get("clip_id", ""))
+                if clip_id in failures_by_clip:
+                    raise ValueError(f"VidaForge clip is both successful and failed: {clip_id!r}")
                 previous = items_by_clip.get(clip_id)
                 if previous is not None and previous != item:
                     raise ValueError(f"Conflicting VidaForge cache entries for clip_id={clip_id!r}")
                 items_by_clip[clip_id] = item
-        if not items_by_clip:
-            raise ValueError("VidaForge preprocessing produced no cache items")
-
+            failure_path = progress_dir / f"{self.generation}-rank-{rank:05d}-failures.json"
+            if not failure_path.is_file():
+                raise FileNotFoundError(f"Missing VidaForge rank failure progress: {failure_path}")
+            rank_failures = json.loads(failure_path.read_text(encoding="utf-8"))
+            if not isinstance(rank_failures, list):
+                raise ValueError(f"VidaForge rank failure progress must contain a list: {failure_path}")
+            for failure in rank_failures:
+                if not isinstance(failure, dict):
+                    raise ValueError(f"Invalid VidaForge rank failure item: {failure_path}")
+                clip_id = str(failure.get("clip_id", "")).strip()
+                stage = str(failure.get("stage", "")).strip()
+                error = str(failure.get("error", "")).strip()
+                source_fingerprint = str(failure.get("source_fingerprint", ""))
+                if (not clip_id or not stage or not error or not re.fullmatch(r"[0-9a-f]{64}", source_fingerprint)):
+                    raise ValueError(f"Incomplete VidaForge rank failure item: {failure_path}")
+                if clip_id in items_by_clip:
+                    raise ValueError(f"VidaForge clip is both successful and failed: {clip_id!r}")
+                previous = failures_by_clip.get(clip_id)
+                if previous is not None and previous != failure:
+                    raise ValueError(f"Conflicting VidaForge failure entries for clip_id={clip_id!r}")
+                failures_by_clip[clip_id] = failure
         sorted_items = [items_by_clip[key] for key in sorted(items_by_clip)]
         shard_names: list[str] = []
         for index, start in enumerate(range(0, len(sorted_items), self.samples_per_shard)):
@@ -480,6 +604,27 @@ class VidaForgeAutoModelWriter:
             _atomic_json(self.output_dir / relative, sorted_items[start:start + self.samples_per_shard])
             shard_names.append(relative.as_posix())
         _atomic_json(self.output_dir / "provenance.json", self.provenance)
+        failures = [failures_by_clip[key] for key in sorted(failures_by_clip)]
+        _atomic_json(self.output_dir / "failures.json", failures)
+        bucket_counts: dict[str, int] = {}
+        for item in sorted_items:
+            width, height = (int(value) for value in item["bucket_resolution"])
+            bucket_key = f"{int(item['bucket_frame_count'])}f/{width}x{height}"
+            bucket_counts[bucket_key] = bucket_counts.get(bucket_key, 0) + 1
+        summary = {
+            "schema_version": _SCHEMA_VERSION,
+            "format": "vidaforge_automodel",
+            "input_count": len(sorted_items) + len(failures),
+            "ok_count": len(sorted_items),
+            "failed_count": len(failures),
+            "bucket_counts": dict(sorted(bucket_counts.items())),
+            "failure_stage_counts": {
+                stage: sum(1 for failure in failures if failure["stage"] == stage)
+                for stage in sorted({str(failure["stage"])
+                                     for failure in failures})
+            },
+        }
+        _atomic_json(self.output_dir / "summary.json", summary)
         _atomic_json(
             self.output_dir / "metadata.json",
             {
@@ -492,6 +637,8 @@ class VidaForgeAutoModelWriter:
                 "text_encoder_fingerprint": self.provenance["text_encoder_fingerprint"],
                 "producer_config_fingerprint": self.provenance["producer_config_fingerprint"],
                 "provenance_file": "provenance.json",
+                "summary_file": "summary.json",
+                "failures_file": "failures.json",
                 "shards": shard_names,
             },
         )
