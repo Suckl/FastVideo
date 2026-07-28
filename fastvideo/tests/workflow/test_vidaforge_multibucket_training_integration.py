@@ -301,8 +301,11 @@ def _assert_oracle_parity(
             torch.testing.assert_close(
                 sample["vae_latent"].float(),
                 oracle.video_latents.float(),
-                atol=5e-3,
-                rtol=5e-3,
+                # The producer persists FP16 after an independent CUDA VAE
+                # forward, so allow one FP16-scale rounding step on larger
+                # latent values while still catching preprocessing drift.
+                atol=1e-2,
+                rtol=1e-2,
             )
             torch.testing.assert_close(
                 sample["text_embedding"].float(),
