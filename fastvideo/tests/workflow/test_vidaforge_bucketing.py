@@ -192,6 +192,32 @@ def test_vidaforge_bucket_planner_handles_fastvideo_and_stage4_rows() -> None:
     ]
 
 
+def test_vidaforge_bucket_planner_prefers_pinned_manifest_metadata() -> None:
+    planner = VidaForgeBucketPlanner(
+        resolution="144p",
+        upscale=False,
+        durations_sec=(2.0, 4.0),
+        temporal_stride=4,
+        input_size_multiple=16,
+        dynamic_forward_batch_size=4,
+    )
+    bucket = planner.bucket_for_item({
+        "duration_sec": 2.04,
+        "fps": 30.0,
+        "resolution": {
+            "width": 40,
+            "height": 30,
+        },
+        "vidaforge_manifest_fps": 25.0,
+        "vidaforge_manifest_resolution": {
+            "width": 1280,
+            "height": 720,
+        },
+    })
+
+    assert bucket == VidaForgeBucket(frame_count=49, width=256, height=144)
+
+
 def test_vidaforge_bucket_planner_requires_reference_fps_for_dynamic_batch() -> None:
     config = SimpleNamespace(
         vidaforge_bucket_resolution="480p",

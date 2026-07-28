@@ -17,6 +17,10 @@ from fastvideo.distributed.parallel_state import get_world_rank, get_world_size
 from fastvideo.logger import init_logger
 from fastvideo.pipelines.pipeline_batch_info import PreprocessBatch
 from fastvideo.pipelines.preprocess.preprocess_stages import resolve_file_backed_video_path
+from fastvideo.workflow.preprocess.vidaforge_bucketing import (
+    vidaforge_source_fps,
+    vidaforge_source_resolution,
+)
 from fastvideo.workflow.preprocess.vidaforge_manifest import build_vidaforge_dataset
 
 logger = init_logger(__name__)
@@ -132,9 +136,11 @@ class VideoForwardBatchBuilder:
         self.seed = seed
 
     def __call__(self, batch: list) -> PreprocessBatch:
+        source_resolutions = [vidaforge_source_resolution(item) for item in batch]
+        source_fps_values = [vidaforge_source_fps(item) for item in batch]
         source_durations = [
             float(item["duration_sec"]) if item.get("duration_sec") is not None else float(item["num_frames"]) /
-            float(item["fps"]) for item in batch
+            source_fps_values[index] for index, item in enumerate(batch)
         ]
         bucket_values = [item.get("_vidaforge_bucket") for item in batch]
         if any(value is not None for value in bucket_values):
@@ -164,11 +170,11 @@ class VideoForwardBatchBuilder:
             "original_video_path":
             resolve_file_backed_video_path(item["video"]),
             "source_resolution": [
-                int(item["resolution"]["width"]),
-                int(item["resolution"]["height"]),
+                source_resolutions[index][0],
+                source_resolutions[index][1],
             ],
             "source_fps":
-            float(item["fps"]),
+            source_fps_values[index],
             "source_frame_count":
             int(item["num_frames"]),
             "source_duration_sec":

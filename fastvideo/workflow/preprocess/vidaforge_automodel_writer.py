@@ -155,8 +155,12 @@ def _safe_child(root: Path, relative_value: object, *, kind: str) -> Path:
 
 
 def build_vidaforge_source_fingerprint(item: dict[str, Any]) -> str:
-    """Bind one cache entry to its cleaned caption, decoded metadata, and media bytes."""
+    """Bind one cache entry to its caption, source contract, and media bytes."""
     from fastvideo.pipelines.preprocess.wan.vidaforge_stages import clean_vidaforge_prompt
+    from fastvideo.workflow.preprocess.vidaforge_bucketing import (
+        vidaforge_source_fps,
+        vidaforge_source_resolution,
+    )
 
     clip_id = str(item.get("clip_id", "")).strip()
     video = item.get("video")
@@ -171,10 +175,8 @@ def build_vidaforge_source_fingerprint(item: dict[str, Any]) -> str:
     else:
         raise ValueError(f"VidaForge producer cannot fingerprint media for {clip_id!r}")
 
-    resolution = item.get("resolution")
-    if not isinstance(resolution, dict):
-        raise ValueError(f"VidaForge producer input resolution is invalid for {clip_id!r}")
-    source_fps = float(item.get("fps", 0))
+    source_width, source_height = vidaforge_source_resolution(item)
+    source_fps = vidaforge_source_fps(item)
     source_frame_count = int(item.get("num_frames", 0))
     source_duration = item.get("duration_sec")
     source_duration_sec = (float(source_duration) if source_duration is not None else source_frame_count /
@@ -185,8 +187,8 @@ def build_vidaforge_source_fingerprint(item: dict[str, Any]) -> str:
         "caption": clean_vidaforge_prompt(str(item.get("caption", ""))),
         "media_sha256": media_sha256,
         "source_resolution": [
-            int(resolution.get("width", 0)),
-            int(resolution.get("height", 0)),
+            source_width,
+            source_height,
         ],
         "source_fps": source_fps,
         "source_frame_count": source_frame_count,

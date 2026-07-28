@@ -19,6 +19,7 @@ from fastvideo.workflow.preprocess.vidaforge_automodel_writer import VidaForgeAu
 from fastvideo.workflow.preprocess.vidaforge_bucketing import (
     VidaForgeBucket,
     VidaForgeBucketPlanner,
+    vidaforge_source_fps,
 )
 
 if TYPE_CHECKING:
@@ -51,7 +52,8 @@ def plan_vidaforge_forward_batches(
 
     if not grouped_items:
         return [], failures
-    reference_fps = max(float(item["fps"]) for _, bucket_items in grouped_items.values() for item in bucket_items)
+    reference_fps = max(
+        vidaforge_source_fps(item) for _, bucket_items in grouped_items.values() for item in bucket_items)
     batches: list[list[dict[str, Any]]] = []
     for bucket, bucket_items in grouped_items.values():
         chunk_size = planner.forward_batch_size(bucket, reference_fps=reference_fps)
@@ -117,6 +119,8 @@ class PreprocessWorkflowVidaForgeAutoModel(PreprocessWorkflowT2V):
                 build_vidaforge_manifest_fingerprint(config.dataset_path),
                 "video_loader_type":
                 config.video_loader_type.value,
+                "preprocess_video_batch_size":
+                config.preprocess_video_batch_size,
                 "max_height":
                 config.max_height,
                 "max_width":
@@ -157,25 +161,34 @@ class PreprocessWorkflowVidaForgeAutoModel(PreprocessWorkflowT2V):
         skipped_samples = 0
 
         def encode_chunk(items: list[dict]) -> int:
+            failure_message: str | None = None
+            forward_batch: PreprocessBatch | None = None
             try:
-                forward_batch: PreprocessBatch = self.video_forward_batch_builder(items)
+                forward_batch = self.video_forward_batch_builder(items)
                 forward_batch = self.preprocess_pipeline.forward(forward_batch, self.fastvideo_args)
                 writer.save_batch(forward_batch, vae=vae)
                 return len(items)
             except Exception as exc:  # noqa: BLE001
+                failure_message = f"{type(exc).__name__}: {exc}"
+            finally:
+                # A failed homogeneous batch can retain large CUDA tensors
+                # through local references. Release it before singleton
+                # retries so empty_cache can actually reclaim the allocation.
+                del forward_batch
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                if len(items) > 1:
-                    # Match VidaForge's recoverable row semantics while still
-                    # getting the throughput benefit of homogeneous batches.
-                    return sum(encode_chunk([item]) for item in items)
-                writer.record_failure(items[0], stage="encoding", error=exc)
-                logger.warning(
-                    "VidaForge producer skipped clip_id=%r after an encoding failure: %s",
-                    items[0].get("clip_id"),
-                    exc,
-                )
-                return 0
+            assert failure_message is not None
+            if len(items) > 1:
+                # Match VidaForge's recoverable row semantics while still
+                # getting the throughput benefit of homogeneous batches.
+                return sum(encode_chunk([item]) for item in items)
+            writer.record_failure(items[0], stage="encoding", error=failure_message)
+            logger.warning(
+                "VidaForge producer skipped clip_id=%r after an encoding failure: %s",
+                items[0].get("clip_id"),
+                failure_message,
+            )
+            return 0
 
         for source_batch in tqdm(
                 self.training_dataloader,

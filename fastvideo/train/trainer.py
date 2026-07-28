@@ -75,12 +75,17 @@ class Trainer:
 
     def _iter_dataloader(self, dataloader: Any) -> Iterator[dict[str, Any]]:
         data_iter = iter(dataloader)
-        while True:
-            batch = next(data_iter, None)
-            if batch is None:
-                data_iter = iter(dataloader)
-                batch = next(data_iter)
-            yield batch
+
+        def stream() -> Iterator[dict[str, Any]]:
+            nonlocal data_iter
+            while True:
+                batch = next(data_iter, None)
+                if batch is None:
+                    data_iter = iter(dataloader)
+                    batch = next(data_iter)
+                yield batch
+
+        return stream()
 
     def _run_method_validation(
         self,

@@ -701,6 +701,11 @@ def test_build_vidaforge_dataset_uses_decoded_media_metadata(tmp_path: Path):
     assert row["fps"] == 25.0
     assert row["num_frames"] == 50
     assert row["duration_sec"] == 2.04
+    assert row["vidaforge_manifest_fps"] == 25.0
+    assert row["vidaforge_manifest_resolution"] == {
+        "width": 1280,
+        "height": 720,
+    }
 
 
 def test_normalize_row_preserves_manifest_duration(tmp_path: Path, monkeypatch) -> None:
@@ -727,6 +732,15 @@ def test_normalize_row_preserves_manifest_duration(tmp_path: Path, monkeypatch) 
     )
 
     assert normalized["duration_sec"] == 2.04
+    assert normalized["resolution"] == {
+        "width": 40,
+        "height": 30,
+    }
+    assert normalized["vidaforge_manifest_fps"] == 24.0
+    assert normalized["vidaforge_manifest_resolution"] == {
+        "width": 1280,
+        "height": 720,
+    }
 
 
 def test_build_vidaforge_stage4_defers_media_probe_until_iteration(tmp_path: Path, monkeypatch):

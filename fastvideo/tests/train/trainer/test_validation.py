@@ -84,6 +84,32 @@ class _DummyMethod:
         self.weight.grad = None
 
 
+def test_iter_dataloader_constructs_underlying_iterator_eagerly(
+    monkeypatch,
+) -> None:
+    tracker = _DummyTracker()
+    group = SimpleNamespace(rank=0, local_rank=0, rank_in_group=0, world_size=1)
+    monkeypatch.setattr("fastvideo.train.trainer.get_world_group", lambda: group)
+    monkeypatch.setattr("fastvideo.train.trainer.get_sp_group", lambda: group)
+    monkeypatch.setattr(
+        "fastvideo.train.trainer.build_tracker",
+        lambda *args, **kwargs: tracker,
+    )
+    events: list[str] = []
+
+    class RecordingLoader:
+
+        def __iter__(self):
+            events.append("iter")
+            return iter([{"sample": "x"}])
+
+    trainer = Trainer(TrainingConfig())
+    stream = trainer._iter_dataloader(RecordingLoader())
+
+    assert events == ["iter"]
+    assert next(stream) == {"sample": "x"}
+
+
 def test_trainer_runs_validation_callback_during_training(
     monkeypatch,
 ) -> None:

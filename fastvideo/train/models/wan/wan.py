@@ -106,6 +106,7 @@ class WanModel(ModelBase):
         self.negative_prompt_embeds: (torch.Tensor | None) = None
         self.negative_prompt_attention_mask: (torch.Tensor | None) = None
         self._requires_negative_conditioning = True
+        self._requires_vae = True
         self._input_latents_are_normalized = False
 
         # Timestep mechanics.
@@ -189,8 +190,9 @@ class WanModel(ModelBase):
             raise ValueError("Unsupported Wan preprocessed_data_type: "
                              f"{preprocessed_data_type!r}")
 
-        if not self._input_latents_are_normalized:
+        if self._requires_vae or not self._input_latents_are_normalized:
             self.ensure_vae()
+        if not self._input_latents_are_normalized:
             text_len = (
                 training_config.pipeline_config.text_encoder_configs[  # type: ignore[union-attr]
                     0].arch_config.text_len)
@@ -207,6 +209,9 @@ class WanModel(ModelBase):
 
     def set_requires_negative_conditioning(self, requires: bool) -> None:
         self._requires_negative_conditioning = bool(requires)
+
+    def set_requires_vae(self, requires: bool) -> None:
+        self._requires_vae = bool(requires)
 
     def shift_and_clamp_timestep(self, timestep: torch.Tensor) -> torch.Tensor:
         timestep = shift_timestep(

@@ -44,6 +44,17 @@ class FineTuneMethod(TrainingMethod):
         if callable(set_requires_negative_conditioning):
             set_requires_negative_conditioning(False)
 
+        # Pre-encoded fine-tuning neither encodes nor decodes video. Let the
+        # Wan model skip its VAE in that mode, while methods that perform
+        # rollouts or first-frame anchoring keep the compatibility default.
+        set_requires_vae = getattr(
+            self.student,
+            "set_requires_vae",
+            None,
+        )
+        if callable(set_requires_vae):
+            set_requires_vae(False)
+
         # Initialize preprocessors on student.
         self.student.init_preprocessors(self.training_config)
 

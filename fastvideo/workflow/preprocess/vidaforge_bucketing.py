@@ -14,6 +14,8 @@ from collections.abc import Mapping
 
 VIDAFORGE_BUCKETING_REFERENCE_REVISION = "4562d3fbcbd4861fc74c2859950c0237363681bb"
 VIDAFORGE_DEFAULT_BUCKET_DURATIONS_SEC = (2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0)
+VIDAFORGE_MANIFEST_FPS_KEY = "vidaforge_manifest_fps"
+VIDAFORGE_MANIFEST_RESOLUTION_KEY = "vidaforge_manifest_resolution"
 
 
 def valid_frame_count_at_or_below(frame_count: int, *, stride: int) -> int:
@@ -220,10 +222,10 @@ class VidaForgeBucketPlanner:
 
     def bucket_for_item(self, item: Mapping[str, Any]) -> VidaForgeBucket:
         """Resolve a normalized FastVideo item or an official Stage 4 row."""
-        source_width, source_height = _source_resolution(item)
+        source_width, source_height = vidaforge_source_resolution(item)
         frame_count = select_bucket_frame_count(
             source_duration_sec=float(item["duration_sec"]),
-            fps=float(item["fps"]),
+            fps=vidaforge_source_fps(item),
             durations_sec=list(self.durations_sec),
             stride=self.temporal_stride,
         )
@@ -269,7 +271,28 @@ class VidaForgeBucketPlanner:
         }
 
 
-def _source_resolution(item: Mapping[str, Any]) -> tuple[int, int]:
+def vidaforge_source_fps(item: Mapping[str, Any]) -> float:
+    """Return the pinned manifest FPS when a normalized row also has probe data."""
+    value = item.get(VIDAFORGE_MANIFEST_FPS_KEY, item.get("fps"))
+    try:
+        fps = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"item fps is invalid: {value!r}") from exc
+    if fps <= 0 or not math.isfinite(fps):
+        raise ValueError(f"item fps must be finite and > 0, got {value!r}")
+    return fps
+
+
+def vidaforge_source_resolution(item: Mapping[str, Any]) -> tuple[int, int]:
+    """Return the pinned manifest resolution when probe metadata is also present."""
+    manifest_resolution = item.get(VIDAFORGE_MANIFEST_RESOLUTION_KEY)
+    if manifest_resolution is not None:
+        if not isinstance(manifest_resolution, Mapping):
+            raise ValueError(f"item manifest resolution is invalid: {manifest_resolution!r}")
+        try:
+            return int(manifest_resolution["width"]), int(manifest_resolution["height"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"item manifest resolution is invalid: {manifest_resolution!r}") from exc
     if "width" in item and "height" in item:
         return int(item["width"]), int(item["height"])
     resolution = item.get("resolution")

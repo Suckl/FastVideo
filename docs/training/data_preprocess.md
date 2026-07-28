@@ -317,9 +317,11 @@ Tokenizer files, including `spiece.model`, are included in the text-encoder
 identity because they also affect the resulting embeddings. The same file
 records a `producer_config_fingerprint` over output-affecting settings such as
 fixed geometry or the complete multi-bucket policy, FPS, caption field,
-selection, manifest content, component precision, and tokenizer sequence
-length. Each item also records a fingerprint over its cleaned caption, media
-bytes, Stage 4 duration, and decoded source metadata.
+selection, manifest content, preprocessing batch size, component precision,
+and tokenizer sequence length. Each item also records a fingerprint over its
+cleaned caption, media bytes, and pinned Stage 4 duration/FPS/resolution
+contract. Decoder-probed metadata remains available for media validation but
+does not silently replace those manifest values during bucket planning.
 
 Interrupted runs do not publish partial `.meta` files. To continue a
 previously published compatible cache, add

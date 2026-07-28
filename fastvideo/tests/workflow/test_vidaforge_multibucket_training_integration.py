@@ -464,6 +464,8 @@ def test_vidaforge_multibucket_producer_training_and_resume(
     assert result["checkpoint_step"] == 1
     assert math.isfinite(result["loss"])
     assert result["loss"] >= 0
+    assert math.isfinite(result["resumed_loss"])
+    assert result["resumed_loss"] >= 0
 
 
 def _optimizer_snapshot(
@@ -583,6 +585,7 @@ def _training_worker_main() -> None:
     from fastvideo.platforms import AttentionBackendEnum
     from fastvideo.train.methods.fine_tuning.finetune import FineTuneMethod
     import fastvideo.train.models.wan.wan as wan_implementation
+    from fastvideo.train.trainer import Trainer
     from fastvideo.train.utils.checkpoint import (
         CheckpointConfig,
         CheckpointManager,
@@ -801,18 +804,56 @@ def _training_worker_main() -> None:
             optimizer_snapshot,
         )
 
-        resumed_iterator = iter(resumed_model.dataloader)
+        # Exercise Trainer's real ordering: construct the underlying stateful
+        # iterator eagerly, then restore RNG last before requesting a batch.
+        resumed_stream = object.__new__(Trainer)._iter_dataloader(
+            resumed_model.dataloader
+        )
         resumed_manager.load_rng_snapshot(str(checkpoint_path))
-        resumed_batch = next(resumed_iterator)
+        resumed_batch = next(resumed_stream)
         _assert_batch_snapshot(resumed_batch, expected_next)
-        resumed_training_batch = resumed_model.prepare_batch(
-            resumed_batch,
-            generator=resumed_method.cuda_generator,
+        resumed_observed_temporal: list[tuple[int, int]] = []
+        resumed_original_prepare_batch = resumed_model.prepare_batch
+
+        def resumed_observed_prepare_batch(
+            raw_batch: dict[str, Any],
+            **kwargs: Any,
+        ) -> Any:
+            prepared = resumed_original_prepare_batch(raw_batch, **kwargs)
+            assert prepared.latents is not None
+            resumed_observed_temporal.append(
+                (
+                    int(raw_batch["vae_latent"].shape[2]),
+                    int(prepared.latents.shape[1]),
+                )
+            )
+            return prepared
+
+        resumed_model.prepare_batch = resumed_observed_prepare_batch
+        resumed_method.optimizers_zero_grad(iteration=1)
+        resumed_loss_map, resumed_outputs, _resumed_metrics = (
+            resumed_method.single_train_step(
+                resumed_batch,
+                iteration=1,
+            )
         )
-        assert resumed_training_batch.latents is not None
-        resumed_prepared_temporal = int(
-            resumed_training_batch.latents.shape[1]
+        resumed_loss = resumed_loss_map["total_loss"]
+        assert torch.isfinite(resumed_loss).item()
+        resumed_method.backward(
+            resumed_loss_map,
+            resumed_outputs,
+            grad_accum_rounds=1,
         )
+        resumed_trainable_parameters = list(
+            resumed_model.transformer.proj_out.parameters()
+        )
+        assert all(
+            parameter.grad is not None
+            and torch.isfinite(parameter.grad).all().item()
+            for parameter in resumed_trainable_parameters
+        )
+        resumed_method.optimizers_schedulers_step(iteration=1)
+        resumed_prepared_temporal = resumed_observed_temporal[-1][1]
         assert resumed_prepared_temporal == resumed_raw_temporal
         assert resumed_raw_temporal > int(cfg.training.data.num_latent_t)
         assert resumed_model.vae is None
@@ -833,6 +874,7 @@ def _training_worker_main() -> None:
                     "vae_load_attempts": len(vae_load_attempts),
                     "checkpoint_step": checkpoint_step,
                     "loss": loss_value,
+                    "resumed_loss": float(resumed_loss.detach().cpu()),
                 },
                 sort_keys=True,
             ),

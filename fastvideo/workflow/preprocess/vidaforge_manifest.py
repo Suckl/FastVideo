@@ -27,6 +27,10 @@ from torch.utils.data import IterableDataset, get_worker_info
 from fastvideo.configs.configs import PreprocessConfig, VideoLoaderType
 from fastvideo.distributed.parallel_state import get_world_group, get_world_rank, get_world_size
 from fastvideo.logger import init_logger
+from fastvideo.workflow.preprocess.vidaforge_bucketing import (
+    VIDAFORGE_MANIFEST_FPS_KEY,
+    VIDAFORGE_MANIFEST_RESOLUTION_KEY,
+)
 
 logger = init_logger(__name__)
 
@@ -59,7 +63,7 @@ _RELEASE_REQUIRED_COLUMNS = frozenset({
     "tar_path",
 })
 _COPY_CHUNK_SIZE = 8 * 1024 * 1024
-_METADATA_CACHE_VERSION = 1
+_METADATA_CACHE_VERSION = 2
 VIDAFORGE_WAN_MAX_TEMPORAL_REPEAT_PAD_FRAMES = 3
 
 
@@ -495,8 +499,8 @@ def _normalize_row(
 ) -> dict[str, Any]:
     clip_id = _clip_id_value(row)
 
-    _positive_number(row, "width")
-    _positive_number(row, "height")
+    manifest_width = _integer_value(row, "width", minimum=1)
+    manifest_height = _integer_value(row, "height", minimum=1)
     manifest_fps = _positive_number(row, "fps")
     source_duration_sec = _positive_number(row, "duration_sec")
 
@@ -533,6 +537,14 @@ def _normalize_row(
         },
         "fps": media["fps"],
         "num_frames": media["num_frames"],
+        # Stage 5 bucketing follows the pinned Stage 4 contract. Keep decoder
+        # probe metadata above for media validation, but do not silently
+        # substitute it for the manifest values used by the official planner.
+        VIDAFORGE_MANIFEST_RESOLUTION_KEY: {
+            "width": manifest_width,
+            "height": manifest_height,
+        },
+        VIDAFORGE_MANIFEST_FPS_KEY: manifest_fps,
         # VidaForge Stage 5 chooses its temporal bucket from the Stage 4
         # duration contract rather than from the decoder's best-effort frame
         # count. Preserve it alongside the probed media metadata.

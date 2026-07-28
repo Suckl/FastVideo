@@ -49,6 +49,7 @@ def _bare_model(training_config: SimpleNamespace) -> WanModel:
     model.training_config = training_config
     model.noise_scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0)
     model._requires_negative_conditioning = False
+    model._requires_vae = True
     model._input_latents_are_normalized = False
     return model
 
@@ -91,7 +92,7 @@ def test_regular_fastvideo_latents_keep_runtime_normalization(
     assert calls == [("wan", latents, model.vae)]
 
 
-def test_vidaforge_preprocessors_skip_vae_load(
+def test_vidaforge_preprocessors_skip_vae_load_when_method_opts_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     training_config = _training_config("vidaforge_automodel")
@@ -117,11 +118,51 @@ def test_vidaforge_preprocessors_skip_vae_load(
         lambda *_args, **_kwargs: loader,
     )
 
+    model.set_requires_vae(False)
     model.init_preprocessors(training_config)
 
     assert model.dataloader is loader
     assert model.vae is None
     assert component_loads == []
+
+
+def test_vidaforge_preprocessors_keep_vae_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    training_config = _training_config("vidaforge_automodel")
+    model = _bare_model(training_config)
+    vae = object()
+    loader = object()
+    component_loads: list[str] = []
+
+    monkeypatch.setattr(
+        "fastvideo.train.models.wan.wan.get_world_group",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        "fastvideo.train.models.wan.wan.get_sp_group",
+        lambda: object(),
+    )
+
+    def fake_load_module_from_path(**kwargs: Any) -> object:
+        component_loads.append(str(kwargs["module_type"]))
+        return vae
+
+    monkeypatch.setattr(
+        "fastvideo.train.models.wan.wan.load_module_from_path",
+        fake_load_module_from_path,
+    )
+    monkeypatch.setattr(
+        "fastvideo.train.utils.dataloader."
+        "build_vidaforge_automodel_train_dataloader",
+        lambda *_args, **_kwargs: loader,
+    )
+
+    model.init_preprocessors(training_config)
+
+    assert model.dataloader is loader
+    assert model.vae is vae
+    assert component_loads == ["vae"]
 
 
 def test_regular_preprocessors_still_load_vae_eagerly(
@@ -255,6 +296,7 @@ def test_finetune_disables_unused_negative_prompt_conditioning(
         set_requires_negative_conditioning=lambda value: events.append(
             ("negative", value)
         ),
+        set_requires_vae=lambda value: events.append(("vae", value)),
         init_preprocessors=lambda value: events.append(("preprocessors", value)),
     )
     cfg = SimpleNamespace(
@@ -274,5 +316,6 @@ def test_finetune_disables_unused_negative_prompt_conditioning(
 
     assert events == [
         ("negative", False),
+        ("vae", False),
         ("preprocessors", training_config),
     ]

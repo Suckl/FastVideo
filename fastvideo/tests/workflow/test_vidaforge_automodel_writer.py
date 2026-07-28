@@ -39,6 +39,7 @@ from fastvideo.workflow.preprocess.preprocess_workflow_vidaforge_automodel impor
     PreprocessWorkflowVidaForgeAutoModel,
     plan_vidaforge_forward_batches,
 )
+from fastvideo.workflow.preprocess.components import VideoForwardBatchBuilder
 from fastvideo.workflow.preprocess.vidaforge_bucketing import VidaForgeBucketPlanner
 
 _MODEL_NAME = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
@@ -968,6 +969,74 @@ def test_multibucket_planning_groups_shapes_scales_batches_and_reports_short_cli
     assert len(failures) == 1
     assert failures[0][0]["clip_id"] == "too-short"
     assert "shorter than the smallest temporal bucket" in str(failures[0][1])
+
+
+def test_multibucket_planning_prefers_manifest_metadata_over_probe_metadata() -> None:
+    planner = VidaForgeBucketPlanner(
+        resolution="480p",
+        upscale=False,
+        durations_sec=(2.0, 4.0),
+        temporal_stride=4,
+        input_size_multiple=16,
+        dynamic_forward_batch_size=4,
+    )
+    items = [{
+        "clip_id": f"clip-{index}",
+        "duration_sec": 4.1,
+        "fps": 8.0,
+        "resolution": {
+            "width": 40,
+            "height": 30,
+        },
+        "vidaforge_manifest_fps": 16.0,
+        "vidaforge_manifest_resolution": {
+            "width": 1920,
+            "height": 1080,
+        },
+    } for index in range(5)]
+
+    batches, failures = plan_vidaforge_forward_batches(items, planner)
+
+    assert failures == []
+    assert [len(batch) for batch in batches] == [4, 1]
+    assert all(
+        item["_vidaforge_bucket"] == {
+            "frame_count": 61,
+            "width": 848,
+            "height": 480,
+        } for batch in batches for item in batch)
+
+
+def test_forward_batch_keeps_probe_and_manifest_metadata_distinct(tmp_path: Path) -> None:
+    video_path = tmp_path / "clip.mp4"
+    video_path.touch()
+    batch = VideoForwardBatchBuilder(seed=7)([{
+        "clip_id": "clip-a",
+        "video": str(video_path),
+        "name": "clip.mp4",
+        "caption": "caption",
+        "duration_sec": 2.04,
+        "fps": 30.0,
+        "num_frames": 60,
+        "resolution": {
+            "width": 40,
+            "height": 30,
+        },
+        "vidaforge_manifest_fps": 25.0,
+        "vidaforge_manifest_resolution": {
+            "width": 1280,
+            "height": 720,
+        },
+    }])
+
+    assert batch.fps == [30.0]
+    assert batch.width == [40]
+    assert batch.height == [30]
+    assert batch.extra["source_metadata"][0]["source_fps"] == 25.0
+    assert batch.extra["source_metadata"][0]["source_resolution"] == [
+        1280,
+        720,
+    ]
 
 
 def test_vidaforge_automodel_config_requires_deterministic_wan_geometry() -> None:
