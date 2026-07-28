@@ -531,17 +531,21 @@ class EpochStatefulDataLoader:
     def __iter__(self) -> Iterator[dict[str, Any]]:
         self._sampler.set_epoch(self._epoch)
         iterator = iter(self._loader)
-        completed = False
-        try:
-            while True:
-                try:
-                    yield next(iterator)
-                except StopIteration:
-                    completed = True
-                    return
-        finally:
-            if completed:
-                self._epoch += 1
+
+        def stream() -> Iterator[dict[str, Any]]:
+            completed = False
+            try:
+                while True:
+                    try:
+                        yield next(iterator)
+                    except StopIteration:
+                        completed = True
+                        return
+            finally:
+                if completed:
+                    self._epoch += 1
+
+        return stream()
 
     def __len__(self) -> int:
         return len(self._loader)

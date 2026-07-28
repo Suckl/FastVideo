@@ -121,6 +121,10 @@ class PreprocessWorkflowVidaForgeAutoModel(PreprocessWorkflowT2V):
                 config.video_loader_type.value,
                 "preprocess_video_batch_size":
                 config.preprocess_video_batch_size,
+                "dataloader_num_workers":
+                config.dataloader_num_workers,
+                "world_size":
+                world_size,
                 "max_height":
                 config.max_height,
                 "max_width":
@@ -175,7 +179,7 @@ class PreprocessWorkflowVidaForgeAutoModel(PreprocessWorkflowT2V):
                 # through local references. Release it before singleton
                 # retries so empty_cache can actually reclaim the allocation.
                 del forward_batch
-                if torch.cuda.is_available():
+                if failure_message is not None and torch.cuda.is_available():
                     torch.cuda.empty_cache()
             assert failure_message is not None
             if len(items) > 1:

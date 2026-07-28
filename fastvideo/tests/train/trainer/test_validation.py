@@ -8,6 +8,9 @@ from typing import Any
 
 import torch
 
+from fastvideo.dataset.vidaforge_automodel_dataset import (
+    EpochStatefulDataLoader,
+)
 from fastvideo.train.callbacks.validation import ValidationCallback
 from fastvideo.train.trainer import Trainer
 from fastvideo.train.utils.training_config import TrainingConfig
@@ -97,16 +100,25 @@ def test_iter_dataloader_constructs_underlying_iterator_eagerly(
     )
     events: list[str] = []
 
-    class RecordingLoader:
+    class RecordingInnerLoader:
 
         def __iter__(self):
-            events.append("iter")
+            events.append("inner_iter")
             return iter([{"sample": "x"}])
 
-    trainer = Trainer(TrainingConfig())
-    stream = trainer._iter_dataloader(RecordingLoader())
+    class RecordingSampler:
 
-    assert events == ["iter"]
+        def set_epoch(self, epoch: int) -> None:
+            events.append(f"epoch_{epoch}")
+
+    trainer = Trainer(TrainingConfig())
+    dataloader = EpochStatefulDataLoader(
+        RecordingInnerLoader(),  # type: ignore[arg-type]
+        RecordingSampler(),  # type: ignore[arg-type]
+    )
+    stream = trainer._iter_dataloader(dataloader)
+
+    assert events == ["epoch_0", "inner_iter"]
     assert next(stream) == {"sample": "x"}
 
 

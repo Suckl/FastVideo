@@ -111,8 +111,8 @@ def _row(
     select_pass: int = 1,
     caption_level_0: str = "short caption",
     caption_level_3: str = "dense caption",
-    width: int = 1280,
-    height: int = 720,
+    width: int = 32,
+    height: int = 24,
     fps: float = 24.0,
     duration_sec: float = 4.0,
 ) -> dict:
@@ -152,8 +152,8 @@ def _release_row(
     filesize_bytes: int,
     sha256: str,
     caption_level_3: str = "dense caption",
-    width: int = 1280,
-    height: int = 720,
+    width: int = 32,
+    height: int = 24,
     fps: float = 25.0,
     duration_sec: float = 4.0,
 ) -> dict:
@@ -683,8 +683,8 @@ def test_build_vidaforge_dataset_uses_decoded_media_metadata(tmp_path: Path):
             _row(
                 clip_id="clip-a",
                 clip_path=str(video_path),
-                width=1280,
-                height=720,
+                width=40,
+                height=30,
                 fps=25.0,
                 duration_sec=2.04,
             )
@@ -703,8 +703,8 @@ def test_build_vidaforge_dataset_uses_decoded_media_metadata(tmp_path: Path):
     assert row["duration_sec"] == 2.04
     assert row["vidaforge_manifest_fps"] == 25.0
     assert row["vidaforge_manifest_resolution"] == {
-        "width": 1280,
-        "height": 720,
+        "width": 40,
+        "height": 30,
     }
 
 
@@ -723,7 +723,13 @@ def test_normalize_row_preserves_manifest_duration(tmp_path: Path, monkeypatch) 
     )
 
     normalized = vidaforge_manifest._normalize_row(
-        _row(clip_id="clip-a", clip_path=str(clip_path), duration_sec=2.04),
+        _row(
+            clip_id="clip-a",
+            clip_path=str(clip_path),
+            width=40,
+            height=30,
+            duration_sec=2.04,
+        ),
         caption_field="caption_level_3",
         manifest_kind=vidaforge_manifest.VidaForgeManifestKind.STAGE4,
         data_root=None,
@@ -738,9 +744,42 @@ def test_normalize_row_preserves_manifest_duration(tmp_path: Path, monkeypatch) 
     }
     assert normalized["vidaforge_manifest_fps"] == 24.0
     assert normalized["vidaforge_manifest_resolution"] == {
-        "width": 1280,
-        "height": 720,
+        "width": 40,
+        "height": 30,
     }
+
+
+def test_normalize_row_rejects_manifest_resolution_mismatch(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    clip_path = tmp_path / "clip.mp4"
+    clip_path.touch()
+    monkeypatch.setattr(
+        vidaforge_manifest,
+        "_probe_video",
+        lambda *_args, **_kwargs: {
+            "width": 40,
+            "height": 30,
+            "fps": 25.0,
+            "num_frames": 50,
+        },
+    )
+
+    with pytest.raises(ValueError, match="does not match decoded media"):
+        vidaforge_manifest._normalize_row(
+            _row(
+                clip_id="clip-a",
+                clip_path=str(clip_path),
+                width=1280,
+                height=720,
+            ),
+            caption_field="caption_level_3",
+            manifest_kind=vidaforge_manifest.VidaForgeManifestKind.STAGE4,
+            data_root=None,
+            materialize_root=None,
+            video_loader_type=VideoLoaderType.TORCHVISION,
+        )
 
 
 def test_build_vidaforge_stage4_defers_media_probe_until_iteration(tmp_path: Path, monkeypatch):
@@ -786,6 +825,8 @@ def test_build_vidaforge_release_materializes_indexed_tar_clip(tmp_path: Path):
                 tar_offset=tar_offset,
                 filesize_bytes=filesize_bytes,
                 sha256=sha256,
+                width=40,
+                height=30,
                 duration_sec=2.04,
             )
         ],

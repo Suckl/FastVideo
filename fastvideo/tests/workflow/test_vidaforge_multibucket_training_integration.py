@@ -750,12 +750,23 @@ def _training_worker_main() -> None:
             expected_next_batch["info_list"][0]["clip_id"]
         )
         assert resumed_raw_temporal != first_raw_temporal
+        expected_training_batch = original_prepare_batch(
+            expected_next_batch,
+            generator=method.cuda_generator,
+        )
+        assert expected_training_batch.noise is not None
+        assert expected_training_batch.timesteps is not None
+        expected_noise = expected_training_batch.noise.detach().cpu().clone()
+        expected_timesteps = (
+            expected_training_batch.timesteps.detach().cpu().clone()
+        )
 
         model.prepare_batch = original_prepare_batch
         del (
             checkpoint_manager,
             dataloader,
             expected_next_batch,
+            expected_training_batch,
             first_batch,
             iterator,
             loss_map,
@@ -821,6 +832,20 @@ def _training_worker_main() -> None:
         ) -> Any:
             prepared = resumed_original_prepare_batch(raw_batch, **kwargs)
             assert prepared.latents is not None
+            assert prepared.noise is not None
+            assert prepared.timesteps is not None
+            torch.testing.assert_close(
+                prepared.noise.detach().cpu(),
+                expected_noise,
+                atol=0,
+                rtol=0,
+            )
+            torch.testing.assert_close(
+                prepared.timesteps.detach().cpu(),
+                expected_timesteps,
+                atol=0,
+                rtol=0,
+            )
             resumed_observed_temporal.append(
                 (
                     int(raw_batch["vae_latent"].shape[2]),

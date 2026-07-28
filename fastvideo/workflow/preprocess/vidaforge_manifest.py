@@ -527,6 +527,12 @@ def _normalize_row(
             raise ValueError("VidaForge-3M Torchvision loading requires a materialization root")
 
     media = _probe_video(media_source, clip_id=clip_id, fallback_fps=manifest_fps)
+    manifest_resolution = (manifest_width, manifest_height)
+    decoded_resolution = (int(media["width"]), int(media["height"]))
+    if decoded_resolution != manifest_resolution:
+        raise ValueError(f"VidaForge row {clip_id!r} manifest resolution "
+                         f"{manifest_width}x{manifest_height} does not match decoded media "
+                         f"{decoded_resolution[0]}x{decoded_resolution[1]}")
     return {
         "video": video,
         "name": _safe_sample_name(clip_id),
