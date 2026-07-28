@@ -303,7 +303,13 @@ class VidaForgeAutoModelWriter:
                 if existing.get("source_fingerprint") != source_fingerprint:
                     raise ValueError(
                         f"Cannot resume VidaForge clip {clip_id!r}: caption, media, or source metadata changed")
-                self._retained_items[clip_id] = existing
+                if clip_id not in self._retained_items:
+                    self._validate_item(
+                        existing,
+                        where=self.output_dir / "metadata.json",
+                        validate_payload=True,
+                    )
+                    self._retained_items[clip_id] = existing
             elif clip_id not in self._new_items:
                 pending.append(item)
         return pending
@@ -531,7 +537,7 @@ class VidaForgeAutoModelWriter:
             for item in shard_items:
                 if not isinstance(item, dict):
                     raise ValueError(f"Invalid VidaForge metadata item in {shard_path}")
-                self._validate_item(item, where=shard_path, validate_payload=True)
+                self._validate_item(item, where=shard_path)
                 clip_id = str(item["clip_id"]).strip()
                 if clip_id in items:
                     raise ValueError(f"Duplicate clip_id in existing VidaForge cache: {clip_id!r}")
@@ -573,13 +579,13 @@ class VidaForgeAutoModelWriter:
         if (not isinstance(latents, torch.Tensor) or not latents.is_floating_point() or latents.ndim != 5
                 or tuple(latents.shape) != tuple(item.get("latent_shape", ()))):
             raise ValueError(f"Resumed VidaForge latent shape mismatch: {cache_path}")
-        if latents.dtype != torch.float16 or not torch.isfinite(latents).all():
-            raise ValueError(f"Resumed VidaForge latents must be finite FP16 tensors: {cache_path}")
+        if latents.dtype != torch.float16:
+            raise ValueError(f"Resumed VidaForge latents must be FP16 tensors: {cache_path}")
         if (not isinstance(embeddings, torch.Tensor) or not embeddings.is_floating_point() or embeddings.ndim != 3
                 or embeddings.shape[0] != 1):
             raise ValueError(f"Resumed VidaForge text embeddings are invalid: {cache_path}")
-        if embeddings.dtype != torch.bfloat16 or not torch.isfinite(embeddings).all():
-            raise ValueError(f"Resumed VidaForge text embeddings must be finite BF16 tensors: {cache_path}")
+        if embeddings.dtype != torch.bfloat16:
+            raise ValueError(f"Resumed VidaForge text embeddings must be BF16 tensors: {cache_path}")
         if not isinstance(metadata, dict):
             raise ValueError(f"Resumed VidaForge metadata is invalid: {cache_path}")
         item_caption_token_length = item.get("caption_token_length")

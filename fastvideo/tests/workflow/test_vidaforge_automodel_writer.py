@@ -520,8 +520,9 @@ def test_resume_rejects_payload_that_disagrees_with_index(tmp_path: Path) -> Non
     payload["metadata"]["clip_id"] = "wrong-clip"
     torch.save(payload, path)
 
+    resumed = _writer(output_dir, model_root, generation="2" * 32, resume=True)
     with pytest.raises(ValueError, match="payload clip_id mismatch"):
-        _writer(output_dir, model_root, generation="2" * 32, resume=True)
+        resumed.pending_items([_source_item("clip-1")])
 
 
 @pytest.mark.parametrize(
@@ -553,15 +554,16 @@ def test_resume_rejects_tampered_text_mask(
     payload["text_mask"] = tampered_mask
     torch.save(payload, path)
 
+    resumed = _writer(output_dir, model_root, generation="4" * 32, resume=True)
     with pytest.raises(ValueError, match=message):
-        _writer(output_dir, model_root, generation="4" * 32, resume=True)
+        resumed.pending_items([_source_item("clip-1")])
 
 
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("video_latents", torch.full((1, 2, 1, 1, 1), float("nan"), dtype=torch.float16), "finite FP16"),
-        ("text_embeddings", torch.ones((1, 3, 8), dtype=torch.float32), "finite BF16"),
+        ("video_latents", torch.ones((1, 2, 1, 1, 1), dtype=torch.float32), "FP16"),
+        ("text_embeddings", torch.ones((1, 3, 8), dtype=torch.float32), "BF16"),
     ],
 )
 def test_resume_rejects_tampered_tensor_contract(
@@ -587,8 +589,77 @@ def test_resume_rejects_tampered_tensor_contract(
     payload[field] = value
     torch.save(payload, path)
 
+    resumed = _writer(output_dir, model_root, generation="a" * 32, resume=True)
     with pytest.raises(ValueError, match=message):
-        _writer(output_dir, model_root, generation="a" * 32, resume=True)
+        resumed.pending_items([_source_item("clip-1")])
+
+
+@pytest.mark.parametrize("tensor_kind", ["latents", "text_embeddings"])
+def test_writer_rejects_nonfinite_new_tensors(tmp_path: Path, tensor_kind: str) -> None:
+    model_root = tmp_path / "model"
+    _write_model(model_root)
+    writer = _writer(tmp_path / "cache", model_root, generation="0" * 32)
+    batch = _batch("clip-1")
+    if tensor_kind == "latents":
+        batch.latents[0, 0, 0, 0, 0] = float("nan")
+        message = "VAE latents must be finite"
+    else:
+        batch.prompt_embeds[0][0, 0, 0] = float("nan")
+        message = "text embeddings must be finite"
+
+    with pytest.raises(ValueError, match=message):
+        writer.save_batch(
+            batch,
+            vae=SimpleNamespace(latents_mean=[1.0, 2.0], latents_std=[2.0, 4.0]),
+        )
+
+
+def test_distributed_resume_validates_only_each_ranks_retained_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_root = tmp_path / "model"
+    output_dir = tmp_path / "cache"
+    _write_model(model_root)
+    first = _writer(output_dir, model_root, generation="1" * 32)
+    vae = SimpleNamespace(latents_mean=[1.0, 2.0], latents_std=[2.0, 4.0])
+    first.save_batch(_batch("clip-rank-0"), vae=vae)
+    first.save_batch(_batch("clip-rank-1"), vae=vae)
+    first.write_rank_progress()
+    assert first.publish() == 2
+
+    original_load = torch.load
+    loaded_paths: list[Path] = []
+
+    def _tracked_load(path, *args, **kwargs):
+        loaded_paths.append(Path(path).resolve())
+        return original_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", _tracked_load)
+    generation = "2" * 32
+    writers = [
+        VidaForgeAutoModelWriter(
+            output_dir,
+            model_root=model_root,
+            model_name=_MODEL_NAME,
+            requested_revision="1" * 40,
+            producer_config=_producer_config(),
+            samples_per_shard=1,
+            resume=True,
+            rank=rank,
+            world_size=2,
+            generation=generation,
+        ) for rank in range(2)
+    ]
+    assert loaded_paths == []
+
+    assert writers[0].pending_items([_source_item("clip-rank-0")]) == []
+    rank_zero_paths = list(loaded_paths)
+    assert len(rank_zero_paths) == 1
+
+    assert writers[1].pending_items([_source_item("clip-rank-1")]) == []
+    assert len(loaded_paths) == 2
+    assert loaded_paths[1] != rank_zero_paths[0]
 
 
 def test_publish_merges_distributed_rank_progress(tmp_path: Path) -> None:
