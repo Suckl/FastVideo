@@ -70,13 +70,23 @@ def test_model_wrapper_explicitly_restores_trainable_params(monkeypatch):
         "layer.lora_A": torch.tensor([10.0, 20.0]),
         "layer.lora_B": torch.tensor([30.0, 40.0]),
     }
+    expected_lora_a = saved_state_dict["layer.lora_A"].clone()
+    expected_lora_b = saved_state_dict["layer.lora_B"].clone()
+
+    def consuming_set_model_state_dict(
+        *_args,
+        model_state_dict,
+        **_kwargs,
+    ):
+        for value in model_state_dict.values():
+            value.zero_()
 
     monkeypatch.setattr(
         "fastvideo.training.checkpointing_utils.set_model_state_dict",
-        lambda *_args, **_kwargs: None,
+        consuming_set_model_state_dict,
     )
     wrapper.load_state_dict(saved_state_dict)
 
-    assert torch.equal(model._lora_a, saved_state_dict["layer.lora_A"])
-    assert torch.equal(model._lora_b, saved_state_dict["layer.lora_B"])
+    assert torch.equal(model._lora_a, expected_lora_a)
+    assert torch.equal(model._lora_b, expected_lora_b)
     assert torch.equal(model._frozen, torch.tensor([5.0, 6.0]))

@@ -32,18 +32,14 @@ class ModelWrapper(torch.distributed.checkpoint.stateful.Stateful):
         return filtered_state_dict
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        set_model_state_dict(
-            self.model,
-            model_state_dict=state_dict,
-            options=StateDictOptions(strict=False),
-        )
         # FSDP2 tracks the parameters that existed when ``fully_shard`` ran.
         # Trainable adapters may be attached afterwards (FastVideo's LoRA
         # path does this), so ``set_model_state_dict`` can silently leave
         # those DTensor parameters at their freshly initialized values when
-        # strict=False. Copy every saved trainable parameter explicitly as a
-        # post-load fallback. For parameters managed by FSDP this is an
-        # idempotent copy of the value already restored above.
+        # strict=False. Copy saved trainable parameters before calling it,
+        # while ``state_dict`` still holds the tensors materialized by DCP.
+        # The official loader then overwrites FSDP-managed parameters; post-
+        # FSDP adapters keep the explicit value because it ignores them.
         named_trainable_parameters = {
             name.replace("._checkpoint_wrapped_module.", "."): parameter
             for name, parameter in self.model.named_parameters() if parameter.requires_grad
@@ -53,6 +49,11 @@ class ModelWrapper(torch.distributed.checkpoint.stateful.Stateful):
                 parameter = named_trainable_parameters.get(name)
                 if parameter is not None:
                     parameter.copy_(value)
+        set_model_state_dict(
+            self.model,
+            model_state_dict=state_dict,
+            options=StateDictOptions(strict=False),
+        )
 
 
 class OptimizerWrapper(torch.distributed.checkpoint.stateful.Stateful):

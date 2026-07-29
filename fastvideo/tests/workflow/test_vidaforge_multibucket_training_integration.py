@@ -680,6 +680,29 @@ def _assert_entrypoint_checkpoint(
     )
 
 
+def _assert_checkpoint_contains_lora_state(
+    checkpoint_dir: Path,
+) -> None:
+    from torch.distributed.checkpoint import FileSystemReader
+
+    metadata = FileSystemReader(
+        str(checkpoint_dir / "dcp")
+    ).read_metadata()
+    keys = [
+        str(key)
+        for key in metadata.state_dict_metadata
+    ]
+    lora_keys = [
+        key
+        for key in keys
+        if ".lora_A" in key or ".lora_B" in key
+    ]
+    assert lora_keys, (
+        "DCP checkpoint does not contain LoRA parameter state; "
+        f"sample keys: {keys[:20]}"
+    )
+
+
 def _run_entrypoint_training_and_resume(
     *,
     model_root: Path,
@@ -713,6 +736,7 @@ def _run_entrypoint_training_and_resume(
         world_size=world_size,
         resume_from_checkpoint=None,
     )
+    _assert_checkpoint_contains_lora_state(first_checkpoint)
     first_checkpoint_fingerprint = _checkpoint_tree_fingerprint(
         first_checkpoint
     )
