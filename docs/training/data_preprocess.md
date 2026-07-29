@@ -375,8 +375,11 @@ torchrun --nproc_per_node="$NUM_GPUS" \
 ```
 
 Do not copy fingerprints from an unrelated cache merely to satisfy validation.
-They are the trust anchor that binds precomputed latents and text embeddings
-to the producer components.
+These expected values make the training run explicitly select one producer
+component identity and catch mixed or accidentally replaced cache entries.
+Reading them from the same cache is not independent proof that the cache
+publisher is trustworthy; verify the cache origin separately when that
+distinction matters.
 
 The loader keeps each batch within one VidaForge temporal/resolution/latent
 bucket and shards global bucket batches across data-parallel groups. All ranks
@@ -490,10 +493,12 @@ the output projection so that the test exercises the real training and
 checkpoint paths without turning an integration gate into a full fine-tuning
 job.
 
-Section 5 extends the same gate to real multi-process production and training.
+Section 5 extends the same gate to real multi-process preprocessing and
+model-training primitives.
 It retains the two oracle-checked official clips, expands only their verified
-cache entries so each bucket contains a complete two-rank DP batch, and checks
-that ranks receive distinct clips while preserving the same bucket order.
+cache entries as a synthetic training-only fixture so each bucket contains a
+complete two-rank DP batch, and checks that ranks receive distinct clips while
+preserving the same bucket order.
 It also saves and restores model, optimizer, dataloader, and per-rank RNG
 state before executing the second bucket's full training step:
 
@@ -510,6 +515,11 @@ This variant requires two CUDA devices and is intended for a two-GPU Modal
 worker. With `drop_last: true`, each real training bucket must contain at least
 `train_batch_size * (world_size / sp_size)` samples; increasing GPU count
 without enough samples in every bucket fails before training.
+
+The gate constructs the real Wan model, `FineTuneMethod`, bucket loader, and
+checkpoint manager directly. It does not invoke the YAML training entrypoint
+or independently test HSDP/FSDP gradient synchronization, which remain covered
+by the modular trainer's distributed test lanes.
 
 ## Creating Your Own Dataset
 

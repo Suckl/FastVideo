@@ -255,7 +255,13 @@ def _expand_cache_for_data_parallel(
     *,
     world_size: int,
 ) -> None:
-    """Give every oracle-verified bucket one full DP global batch."""
+    """Give every oracle-verified bucket one synthetic DP global batch.
+
+    The aliases are consumed only by the training loader in this test. They
+    intentionally retain the verified tensor/source fingerprint and do not
+    rewrite the producer's summary; the expanded directory must never be
+    treated as a resumable producer output.
+    """
     if world_size == 1:
         return
 
