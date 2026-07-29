@@ -43,3 +43,23 @@ def test_model_wrapper_filters_wrapped_trainable_params(monkeypatch):
     assert torch.equal(filtered_state_dict["layer.lora_A"], mocked_state_dict["layer.lora_A"])
     assert torch.equal(filtered_state_dict["layer.lora_B"], mocked_state_dict["layer.lora_B"])
     assert "layer.frozen_weight" not in filtered_state_dict
+
+
+def test_model_wrapper_explicitly_restores_trainable_params(monkeypatch):
+    """Restore adapters that FSDP2 did not track when it was wrapped."""
+    model = DummyWrappedModule()
+    wrapper = ModelWrapper(model)
+    saved_state_dict = {
+        "layer.lora_A": torch.tensor([10.0, 20.0]),
+        "layer.lora_B": torch.tensor([30.0, 40.0]),
+    }
+
+    monkeypatch.setattr(
+        "fastvideo.training.checkpointing_utils.set_model_state_dict",
+        lambda *_args, **_kwargs: None,
+    )
+    wrapper.load_state_dict(saved_state_dict)
+
+    assert torch.equal(model._lora_a, saved_state_dict["layer.lora_A"])
+    assert torch.equal(model._lora_b, saved_state_dict["layer.lora_B"])
+    assert torch.equal(model._frozen, torch.tensor([5.0, 6.0]))
