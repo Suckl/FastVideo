@@ -40,26 +40,29 @@ class ModelWrapper(torch.distributed.checkpoint.stateful.Stateful):
         # Trainable adapters may be attached afterwards (FastVideo's LoRA
         # path does this), so ``set_model_state_dict`` can silently leave
         # those DTensor parameters at their freshly initialized values when
-        # strict=False. Copy saved trainable parameters before calling it,
-        # while ``state_dict`` still holds the tensors materialized by DCP.
-        # The official loader then overwrites FSDP-managed parameters; post-
-        # FSDP adapters keep the explicit value because it ignores them.
+        # strict=False. Preserve independent copies before invoking the
+        # official loader because it may consume or mutate ``state_dict``.
+        # Restore the copies afterwards so neither that mutation nor any
+        # FSDP-managed write can overwrite post-FSDP adapters.
         named_trainable_parameters = {
             name.replace("._checkpoint_wrapped_module.", "."): parameter
             for name, parameter in self.model.named_parameters() if parameter.requires_grad
         }
-        with torch.no_grad():
-            for name, value in state_dict.items():
-                parameter = named_trainable_parameters.get(name)
-                if parameter is not None:
-                    destination = (parameter.to_local() if isinstance(parameter, DTensor) else parameter)
-                    source = (value.to_local() if isinstance(value, DTensor) else value)
-                    destination.copy_(source)
+        saved_trainable_parameters = {
+            name: value.detach().clone()
+            for name, value in state_dict.items() if name in named_trainable_parameters
+        }
         set_model_state_dict(
             self.model,
             model_state_dict=state_dict,
             options=StateDictOptions(strict=False),
         )
+        with torch.no_grad():
+            for name, value in saved_trainable_parameters.items():
+                parameter = named_trainable_parameters[name]
+                destination = (parameter.to_local() if isinstance(parameter, DTensor) else parameter)
+                source = (value.to_local() if isinstance(value, DTensor) else value)
+                destination.copy_(source)
 
 
 class OptimizerWrapper(torch.distributed.checkpoint.stateful.Stateful):

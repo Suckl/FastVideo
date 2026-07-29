@@ -76,12 +76,15 @@ def test_model_wrapper_explicitly_restores_trainable_params(monkeypatch):
     expected_lora_b = saved_state_dict["layer.lora_B"].clone()
 
     def consuming_set_model_state_dict(
-        *_args,
+        loaded_model,
         model_state_dict,
         **_kwargs,
     ):
-        for value in model_state_dict.values():
-            value.zero_()
+        with torch.no_grad():
+            loaded_model._lora_a.zero_()
+            loaded_model._lora_b.zero_()
+            for value in model_state_dict.values():
+                value.zero_()
 
     monkeypatch.setattr(
         "fastvideo.training.checkpointing_utils.set_model_state_dict",
