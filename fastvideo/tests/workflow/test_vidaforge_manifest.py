@@ -321,6 +321,12 @@ def test_build_vidaforge_dataset_normalizes_relative_clip_path(tmp_path: Path):
         },
         "fps": 24.0,
         "num_frames": 4,
+        "vidaforge_manifest_resolution": {
+            "width": 32,
+            "height": 24,
+        },
+        "vidaforge_manifest_fps": 24.0,
+        "duration_sec": 4.0,
         "caption": "dense caption",
     }]
 

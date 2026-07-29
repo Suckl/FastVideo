@@ -287,6 +287,114 @@ def test_stateful_dataloader_resume_preserves_next_batch_and_cfg(
     assert len(first_epoch) == 3
 
 
+def test_distributed_rank_resume_preserves_disjoint_bucket_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset_root = tmp_path / "cache"
+    second_bucket_root = tmp_path / "second-bucket"
+    _write_dataset(dataset_root, count=8)
+    _write_dataset(
+        second_bucket_root,
+        count=8,
+        frame_count=33,
+        resolution=(48, 64),
+        latent_shape=(1, 16, 9, 8, 6),
+    )
+    second_items = json.loads(
+        (
+            second_bucket_root / "shards" / "metadata-000000.json"
+        ).read_text(encoding="utf-8")
+    )
+    for index, item in enumerate(second_items):
+        second_clip_id = f"second-clip-{index}"
+        payload_path = Path(item["cache_file"])
+        payload = torch.load(payload_path, weights_only=True)
+        payload["metadata"]["clip_id"] = second_clip_id
+        torch.save(payload, payload_path)
+        item["clip_id"] = second_clip_id
+    second_shard = dataset_root / "shards" / "metadata-000001.json"
+    second_shard.write_text(json.dumps(second_items), encoding="utf-8")
+    root_metadata_path = dataset_root / "metadata.json"
+    root_metadata = json.loads(
+        root_metadata_path.read_text(encoding="utf-8")
+    )
+    root_metadata["shards"].append("shards/metadata-000001.json")
+    root_metadata_path.write_text(
+        json.dumps(root_metadata),
+        encoding="utf-8",
+    )
+
+    module = "fastvideo.dataset.vidaforge_automodel_dataset"
+    monkeypatch.setattr(f"{module}.get_world_size", lambda: 2)
+    monkeypatch.setattr(f"{module}.get_sp_world_size", lambda: 1)
+
+    def build_rank_loader(rank: int):
+        monkeypatch.setattr(f"{module}.get_world_rank", lambda: rank)
+        return build_vidaforge_automodel_dataloader(
+            dataset_root,
+            batch_size=2,
+            num_data_workers=0,
+            cfg_rate=0.5,
+            seed=29,
+            expected_model_name=_MODEL_NAME,
+            expected_vae_fingerprint=_VAE_FINGERPRINT,
+            expected_text_encoder_fingerprint=_TEXT_ENCODER_FINGERPRINT,
+        )[1]
+
+    originals = [build_rank_loader(rank) for rank in range(2)]
+    iterators = [iter(loader) for loader in originals]
+    consumed = [
+        [next(iterator), next(iterator)]
+        for iterator in iterators
+    ]
+    states = [loader.state_dict() for loader in originals]
+    expected = [next(iterator) for iterator in iterators]
+
+    assert {
+        int(batch["vae_latent"].shape[2])
+        for rank_batches in consumed
+        for batch in rank_batches
+    } == {int(consumed[0][0]["vae_latent"].shape[2])}
+    assert expected[0]["vae_latent"].shape[2] != (
+        consumed[0][0]["vae_latent"].shape[2]
+    )
+    assert {
+        info["clip_id"]
+        for batch in consumed[0]
+        for info in batch["info_list"]
+    }.isdisjoint({
+        info["clip_id"]
+        for batch in consumed[1]
+        for info in batch["info_list"]
+    })
+
+    resumed = [build_rank_loader(rank) for rank in range(2)]
+    actual_batches = []
+    for rank, loader in enumerate(resumed):
+        loader.load_state_dict(states[rank])
+        actual = next(iter(loader))
+        actual_batches.append(actual)
+        assert torch.equal(
+            actual["vae_latent"],
+            expected[rank]["vae_latent"],
+        )
+        assert torch.equal(
+            actual["text_embedding"],
+            expected[rank]["text_embedding"],
+        )
+        assert actual["info_list"] == expected[rank]["info_list"]
+    assert {
+        info["clip_id"]
+        for batch in expected
+        for info in batch["info_list"]
+    } == {
+        info["clip_id"]
+        for batch in actual_batches
+        for info in batch["info_list"]
+    }
+
+
 def test_each_epoch_reshuffles_samples_and_cfg_assignment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

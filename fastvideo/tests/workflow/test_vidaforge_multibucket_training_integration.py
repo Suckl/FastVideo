@@ -12,13 +12,16 @@ one short landscape clip and one longer portrait clip. It exercises:
 
 Set ``VIDAFORGE_RUN_MULTIBUCKET_TRAINING_INTEGRATION=1`` and point
 ``VIDAFORGE_REFERENCE_DIR`` at VidaForge commit
-``4562d3fbcbd4861fc74c2859950c0237363681bb`` to run it. The test is intended
-for a single Modal L40S and is skipped during ordinary CPU test runs.
+``4562d3fbcbd4861fc74c2859950c0237363681bb`` to run it. The default test is
+sized for one Modal L40S; set ``VIDAFORGE_INTEGRATION_WORLD_SIZE=2`` for the
+Section 5 distributed gate on two GPUs. It is skipped during ordinary CPU
+test runs.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import gc
 import hashlib
 import json
@@ -37,6 +40,7 @@ import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 
 _RUN_ENV = "VIDAFORGE_RUN_MULTIBUCKET_TRAINING_INTEGRATION"
+_WORLD_SIZE_ENV = "VIDAFORGE_INTEGRATION_WORLD_SIZE"
 _MODEL_NAME = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 _MODEL_REVISION = "0fad780a534b6463e45facd96134c9f345acfa5b"
 _VIDAFORGE_REVISION = "4562d3fbcbd4861fc74c2859950c0237363681bb"
@@ -77,6 +81,13 @@ _CLIPS = (
 
 def _timeout_seconds() -> int:
     return int(os.environ.get("VIDAFORGE_INTEGRATION_TIMEOUT_SEC", "7200"))
+
+
+def _integration_world_size() -> int:
+    world_size = int(os.environ.get(_WORLD_SIZE_ENV, "1"))
+    if world_size <= 0:
+        raise ValueError(f"{_WORLD_SIZE_ENV} must be greater than zero")
+    return world_size
 
 
 def _validate_reference_checkout() -> Path:
@@ -175,13 +186,14 @@ def _run_fastvideo_producer(
     model_root: Path,
     manifest_path: Path,
     output_dir: Path,
+    world_size: int,
 ) -> None:
     command = [
         sys.executable,
         "-m",
         "torch.distributed.run",
         "--standalone",
-        "--nproc-per-node=1",
+        f"--nproc-per-node={world_size}",
         "-m",
         "fastvideo.pipelines.preprocess.v1_preprocessing_new",
         "--model-path",
@@ -236,6 +248,156 @@ def _run_fastvideo_producer(
         "1",
     ]
     subprocess.run(command, check=True, timeout=_timeout_seconds())
+
+
+def _expand_cache_for_data_parallel(
+    output_dir: Path,
+    *,
+    world_size: int,
+) -> None:
+    """Give every oracle-verified bucket one full DP global batch."""
+    if world_size == 1:
+        return
+
+    metadata_path = output_dir / "metadata.json"
+    root = json.loads(metadata_path.read_text(encoding="utf-8"))
+    items: list[dict[str, Any]] = []
+    for shard_name in root["shards"]:
+        shard_path = output_dir / str(shard_name)
+        items.extend(json.loads(shard_path.read_text(encoding="utf-8")))
+    assert len(items) == len(_CLIPS)
+
+    expanded_items: list[dict[str, Any]] = []
+    for item in items:
+        source_path = output_dir / str(item["cache_file"])
+        source_payload = torch.load(
+            source_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+        expanded_items.append(item)
+        for replica in range(1, world_size):
+            replica_item = copy.deepcopy(item)
+            replica_payload = copy.deepcopy(source_payload)
+            replica_clip_id = (
+                f"{item['clip_id']}:fastvideo-dp-replica:{replica:05d}"
+            )
+            digest = hashlib.sha256(
+                replica_clip_id.encode("utf-8")
+            ).hexdigest()
+            replica_path = (
+                source_path.parent
+                / "section5-dp"
+                / f"{digest}.meta"
+            )
+            replica_path.parent.mkdir(parents=True, exist_ok=True)
+            replica_payload["metadata"]["clip_id"] = replica_clip_id
+            torch.save(replica_payload, replica_path)
+            replica_item["clip_id"] = replica_clip_id
+            replica_item["cache_file"] = (
+                replica_path.relative_to(output_dir).as_posix()
+            )
+            expanded_items.append(replica_item)
+
+    expanded_items.sort(key=lambda item: str(item["clip_id"]))
+    shard_path = output_dir / "shards" / "section5-distributed.json"
+    shard_path.write_text(
+        json.dumps(expanded_items, sort_keys=True),
+        encoding="utf-8",
+    )
+    root["shards"] = [shard_path.relative_to(output_dir).as_posix()]
+    metadata_path.write_text(
+        json.dumps(root, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def test_expand_cache_for_data_parallel_preserves_bucket_contract(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "stage5"
+    shard_dir = output_dir / "shards"
+    shard_dir.mkdir(parents=True)
+    items = []
+    for index, spec in enumerate(_CLIPS):
+        cache_path = (
+            output_dir
+            / f"{spec.bucket_frame_count}f"
+            / f"{spec.bucket_resolution[0]}x{spec.bucket_resolution[1]}"
+            / f"sample-{index}.meta"
+        )
+        cache_path.parent.mkdir(parents=True)
+        latent_shape = (
+            1,
+            16,
+            (spec.bucket_frame_count - 1) // 4 + 1,
+            spec.bucket_resolution[1] // 8,
+            spec.bucket_resolution[0] // 8,
+        )
+        torch.save(
+            {
+                "video_latents": torch.zeros(
+                    latent_shape,
+                    dtype=torch.float16,
+                ),
+                "text_embeddings": torch.zeros(
+                    (1, 8, 12),
+                    dtype=torch.bfloat16,
+                ),
+                "text_mask": torch.ones((1, 8)),
+                "metadata": {
+                    "model_type": "wan",
+                    "model_name": _MODEL_NAME,
+                    "clip_id": spec.clip_id,
+                    "caption": "test",
+                    "caption_token_length": 8,
+                    "bucket_resolution": list(spec.bucket_resolution),
+                    "bucket_frame_count": spec.bucket_frame_count,
+                    "vae_fingerprint": "a" * 64,
+                    "text_encoder_fingerprint": "b" * 64,
+                },
+                "bucket_frame_count": spec.bucket_frame_count,
+            },
+            cache_path,
+        )
+        items.append({
+            "cache_file": cache_path.relative_to(output_dir).as_posix(),
+            "bucket_resolution": list(spec.bucket_resolution),
+            "bucket_frame_count": spec.bucket_frame_count,
+            "latent_shape": list(latent_shape),
+            "clip_id": spec.clip_id,
+            "caption_token_length": 8,
+        })
+    (shard_dir / "metadata.json").write_text(
+        json.dumps(items),
+        encoding="utf-8",
+    )
+    (output_dir / "metadata.json").write_text(
+        json.dumps({"shards": ["shards/metadata.json"]}),
+        encoding="utf-8",
+    )
+
+    _expand_cache_for_data_parallel(output_dir, world_size=2)
+
+    from fastvideo.dataset.vidaforge_automodel_dataset import (
+        VidaForgeAutoModelDataset,
+    )
+
+    dataset = VidaForgeAutoModelDataset(
+        output_dir,
+        expected_model_name=_MODEL_NAME,
+        expected_vae_fingerprint="a" * 64,
+        expected_text_encoder_fingerprint="b" * 64,
+    )
+    assert len(dataset) == 4
+    assert sorted(len(indices) for indices in dataset.bucket_groups.values()) == [
+        2,
+        2,
+    ]
+    assert len({
+        dataset[index]["info"]["clip_id"]
+        for index in range(len(dataset))
+    }) == 4
 
 
 def _load_produced_samples(
@@ -330,6 +492,7 @@ def _run_training_worker(
     checkpoint_dir: Path,
     result_path: Path,
     provenance: dict[str, Any],
+    world_size: int,
 ) -> None:
     environment = dict(os.environ)
     environment["FASTVIDEO_ATTENTION_BACKEND"] = "TORCH_SDPA"
@@ -339,7 +502,7 @@ def _run_training_worker(
         "-m",
         "torch.distributed.run",
         "--standalone",
-        "--nproc-per-node=1",
+        f"--nproc-per-node={world_size}",
         str(Path(__file__).resolve()),
         "--training-worker",
         "--model-root",
@@ -373,6 +536,13 @@ def test_vidaforge_multibucket_producer_training_and_resume(
     if not torch.cuda.is_available():
         pytest.fail("The VidaForge multi-bucket integration test requires CUDA")
 
+    world_size = _integration_world_size()
+    if torch.cuda.device_count() < world_size:
+        pytest.fail(
+            f"The VidaForge integration requested {world_size} GPUs via "
+            f"{_WORLD_SIZE_ENV}, but found {torch.cuda.device_count()}"
+        )
+
     reference_dir = _validate_reference_checkout()
     rows = _release_rows()
     video_paths = _download_release_clips(rows, tmp_path)
@@ -390,6 +560,7 @@ def test_vidaforge_multibucket_producer_training_and_resume(
         model_root=model_root,
         manifest_path=manifest_path,
         output_dir=output_dir,
+        world_size=world_size,
     )
 
     provenance = json.loads(
@@ -439,6 +610,10 @@ def test_vidaforge_multibucket_producer_training_and_resume(
     gc.collect()
     torch.cuda.empty_cache()
 
+    _expand_cache_for_data_parallel(
+        output_dir,
+        world_size=world_size,
+    )
     result_path = tmp_path / "training-result.json"
     _run_training_worker(
         model_root=model_root,
@@ -446,26 +621,37 @@ def test_vidaforge_multibucket_producer_training_and_resume(
         checkpoint_dir=tmp_path / "checkpoints",
         result_path=result_path,
         provenance=provenance,
+        world_size=world_size,
     )
-    result = json.loads(result_path.read_text(encoding="utf-8"))
-    assert {
-        result["first_clip_id"],
-        result["resumed_clip_id"],
-    } == {spec.clip_id for spec in _CLIPS}
-    assert result["first_raw_temporal"] > 1
-    assert result["first_prepared_temporal"] == result["first_raw_temporal"]
-    assert result["resumed_raw_temporal"] > 1
-    assert result["resumed_prepared_temporal"] == (
-        result["resumed_raw_temporal"]
-    )
-    assert result["first_raw_temporal"] != result["resumed_raw_temporal"]
-    assert result["num_latent_t"] == 1
-    assert result["vae_load_attempts"] == 0
-    assert result["checkpoint_step"] == 1
-    assert math.isfinite(result["loss"])
-    assert result["loss"] >= 0
-    assert math.isfinite(result["resumed_loss"])
-    assert result["resumed_loss"] >= 0
+    results = [
+        json.loads(
+            _rank_result_path(result_path, rank).read_text(encoding="utf-8")
+        )
+        for rank in range(world_size)
+    ]
+    assert len({result["first_clip_id"] for result in results}) == world_size
+    assert len({result["resumed_clip_id"] for result in results}) == world_size
+    assert len({result["first_raw_temporal"] for result in results}) == 1
+    assert len({result["resumed_raw_temporal"] for result in results}) == 1
+    for result in results:
+        assert result["first_raw_temporal"] > 1
+        assert result["first_prepared_temporal"] == result["first_raw_temporal"]
+        assert result["resumed_raw_temporal"] > 1
+        assert result["resumed_prepared_temporal"] == (
+            result["resumed_raw_temporal"]
+        )
+        assert result["first_raw_temporal"] != result["resumed_raw_temporal"]
+        assert result["num_latent_t"] == 1
+        assert result["vae_load_attempts"] == 0
+        assert result["checkpoint_step"] == 1
+        assert math.isfinite(result["loss"])
+        assert result["loss"] >= 0
+        assert math.isfinite(result["resumed_loss"])
+        assert result["resumed_loss"] >= 0
+
+
+def _rank_result_path(path: Path, rank: int) -> Path:
+    return path.with_name(f"{path.stem}-rank-{rank:05d}{path.suffix}")
 
 
 def _optimizer_snapshot(
@@ -627,6 +813,16 @@ def _training_worker_main() -> None:
         "0",
         "--training.data.num_latent_t",
         "1",
+        "--training.distributed.num_gpus",
+        str(torch.distributed.get_world_size()),
+        "--training.distributed.sp_size",
+        "1",
+        "--training.distributed.tp_size",
+        "1",
+        "--training.distributed.hsdp_replicate_dim",
+        str(torch.distributed.get_world_size()),
+        "--training.distributed.hsdp_shard_dim",
+        "1",
         "--training.optimizer.learning_rate",
         "0.001",
         "--training.optimizer.weight_decay",
@@ -740,6 +936,10 @@ def _training_worker_main() -> None:
         checkpoint_manager.save(step=1)
         checkpoint_path = args.checkpoint_dir / "checkpoint-1"
         assert (checkpoint_path / "dcp").is_dir()
+        assert (
+            checkpoint_path
+            / f"rng_state_rank{torch.distributed.get_rank()}.pt"
+        ).is_file()
 
         expected_next_batch = next(iterator)
         expected_next = _batch_snapshot(expected_next_batch)
@@ -884,7 +1084,10 @@ def _training_worker_main() -> None:
         assert resumed_model.vae is None
         assert vae_load_attempts == []
 
-        args.result_path.write_text(
+        _rank_result_path(
+            args.result_path,
+            torch.distributed.get_rank(),
+        ).write_text(
             json.dumps(
                 {
                     "first_clip_id": first_clip_id,

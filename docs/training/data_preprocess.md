@@ -346,6 +346,38 @@ training:
     seed: 42
 ```
 
+The ready-to-run LoRA recipe is
+`examples/train/configs/fine_tuning/wan/vidaforge_automodel_t2v_lora.yaml`.
+Keep the expected fingerprints out of a reusable YAML template and read them
+from the cache produced in the immediately preceding step:
+
+```bash
+CACHE_DIR=/data/vidaforge-stage5
+NUM_GPUS=1
+VAE_FINGERPRINT=$(python -c \
+  "import json,sys; print(json.load(open(sys.argv[1]))['vae_fingerprint'])" \
+  "$CACHE_DIR/provenance.json")
+TEXT_FINGERPRINT=$(python -c \
+  "import json,sys; print(json.load(open(sys.argv[1]))['text_encoder_fingerprint'])" \
+  "$CACHE_DIR/provenance.json")
+
+torchrun --nproc_per_node="$NUM_GPUS" \
+  -m fastvideo.train.entrypoint.train \
+  --config \
+    examples/train/configs/fine_tuning/wan/vidaforge_automodel_t2v_lora.yaml \
+  --training.distributed.num_gpus "$NUM_GPUS" \
+  --training.distributed.sp_size 1 \
+  --training.distributed.hsdp_replicate_dim 1 \
+  --training.distributed.hsdp_shard_dim "$NUM_GPUS" \
+  --training.data.data_path "$CACHE_DIR" \
+  --training.data.vidaforge_vae_fingerprint "$VAE_FINGERPRINT" \
+  --training.data.vidaforge_text_encoder_fingerprint "$TEXT_FINGERPRINT"
+```
+
+Do not copy fingerprints from an unrelated cache merely to satisfy validation.
+They are the trust anchor that binds precomputed latents and text embeddings
+to the producer components.
+
 The loader keeps each batch within one VidaForge temporal/resolution/latent
 bucket and shards global bucket batches across data-parallel groups. All ranks
 inside one FastVideo sequence-parallel group receive the same sample indices.
@@ -457,6 +489,27 @@ This gate is sized for one Modal L40S. It freezes the Wan backbone except for
 the output projection so that the test exercises the real training and
 checkpoint paths without turning an integration gate into a full fine-tuning
 job.
+
+Section 5 extends the same gate to real multi-process production and training.
+It retains the two oracle-checked official clips, expands only their verified
+cache entries so each bucket contains a complete two-rank DP batch, and checks
+that ranks receive distinct clips while preserving the same bucket order.
+It also saves and restores model, optimizer, dataloader, and per-rank RNG
+state before executing the second bucket's full training step:
+
+```bash
+VIDAFORGE_RUN_MULTIBUCKET_TRAINING_INTEGRATION=1 \
+VIDAFORGE_INTEGRATION_WORLD_SIZE=2 \
+VIDAFORGE_REFERENCE_DIR=/tmp/VidaForge \
+pytest \
+    fastvideo/tests/workflow/test_vidaforge_multibucket_training_integration.py \
+    -vs
+```
+
+This variant requires two CUDA devices and is intended for a two-GPU Modal
+worker. With `drop_last: true`, each real training bucket must contain at least
+`train_batch_size * (world_size / sp_size)` samples; increasing GPU count
+without enough samples in every bucket fails before training.
 
 ## Creating Your Own Dataset
 

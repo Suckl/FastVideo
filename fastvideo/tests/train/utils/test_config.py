@@ -124,6 +124,43 @@ def test_vidaforge_automodel_data_type_is_accepted(tmp_path: Path) -> None:
     assert cfg.training.data.vidaforge_allow_unverified_model is True
 
 
+def test_vidaforge_lora_example_accepts_provenance_overrides() -> None:
+    config_path = (
+        Path(__file__).resolve().parents[4]
+        / "examples"
+        / "train"
+        / "configs"
+        / "fine_tuning"
+        / "wan"
+        / "vidaforge_automodel_t2v_lora.yaml"
+    )
+
+    cfg = load_run_config(
+        str(config_path),
+        overrides=[
+            "--training.distributed.num_gpus",
+            "2",
+            "--training.distributed.hsdp_shard_dim",
+            "2",
+            "--training.data.data_path",
+            "/data/generated-stage5",
+            "--training.data.vidaforge_vae_fingerprint",
+            "a" * 64,
+            "--training.data.vidaforge_text_encoder_fingerprint",
+            "b" * 64,
+        ],
+    )
+
+    assert cfg.training.distributed.num_gpus == 2
+    assert cfg.training.distributed.hsdp_shard_dim == 2
+    assert cfg.training.data.data_path == "/data/generated-stage5"
+    assert cfg.training.data.preprocessed_data_type == "vidaforge_automodel"
+    assert cfg.training.data.vidaforge_allow_unverified_model is False
+    assert cfg.training.data.vidaforge_vae_fingerprint == "a" * 64
+    assert cfg.training.data.vidaforge_text_encoder_fingerprint == "b" * 64
+    assert cfg.models["student"]["lora"]["enable"] is True
+
+
 @pytest.mark.parametrize("raw_value", ["false", "0", "no", 0, 1])
 def test_vidaforge_unverified_model_opt_in_requires_yaml_bool(
     tmp_path: Path,
