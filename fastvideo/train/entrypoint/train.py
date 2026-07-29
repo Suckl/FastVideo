@@ -46,6 +46,7 @@ def run_training_from_config(
     )
     from fastvideo.train.utils.builder import build_from_config
     from fastvideo.train.utils.config import load_run_config
+    from fastvideo.utils import set_random_seed
 
     # Enable deterministic mode for reproducibility.
     torch.backends.cudnn.benchmark = False
@@ -53,6 +54,11 @@ def run_training_from_config(
 
     cfg = load_run_config(config_path, overrides=overrides)
     tc = cfg.training
+    # Model construction can create fresh trainable parameters (notably LoRA
+    # adapters) before TrainingMethod.on_train_start() seeds the step RNG.
+    # Seed here so independent launches and replicated ranks start from the
+    # same trainable state.
+    set_random_seed(int(tc.data.seed))
 
     model_path_lower = str(tc.model_path).lower()
 

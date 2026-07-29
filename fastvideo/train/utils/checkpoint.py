@@ -244,6 +244,8 @@ class CheckpointManager:
         save_steps = int(self.config.save_steps or 0)
         if save_steps <= 0:
             return
+        if self._last_saved_step == step:
+            return
         self.save(step)
 
     def save(self, step: int) -> None:

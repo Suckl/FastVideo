@@ -539,13 +539,16 @@ pytest \
 
 The first entrypoint process trains step 1 and writes `checkpoint-1`. A fresh
 two-rank process then resolves `resume_from_checkpoint: latest`, restores the
-sharded model, optimizer, dataloader, callback, and per-rank RNG state, trains
-step 2 from the remaining bucket, and writes `checkpoint-2`. The gate verifies
-the resolved HSDP settings in checkpoint metadata and checks that the second
-process did not rewrite `checkpoint-1`; a non-resumed two-step run would do so.
-Together with Section 5's exact per-rank batch, noise, timestep, and bucket
-assertions, this covers both the low-level resume contract and the actual
-documented launch path.
+sharded model, optimizer, dataloader, and per-rank RNG state, trains step 2,
+and writes `checkpoint-2`. A test-only `WanModel` subclass records each rank's
+clip, bucket, noise, timestep, trainable LoRA state, optimizer state, and
+runtime DTensor placements without changing the training computation. The
+gate compares those receipts with a clean uninterrupted two-step entrypoint
+run, requires the resumed process to consume the second bucket, and requires
+at least one transformer parameter to have a runtime `Shard` placement. It
+also checks that the second process did not rewrite `checkpoint-1`; a
+non-resumed two-step run would do so. This covers both the low-level resume
+contract and the actual documented launch path.
 
 ## Creating Your Own Dataset
 

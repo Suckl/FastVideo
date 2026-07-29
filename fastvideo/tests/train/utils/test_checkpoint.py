@@ -358,3 +358,19 @@ def test_maybe_save_triggers_on_each_interval(tmp_path: Path) -> None:
     for step in range(1, 41):
         mgr.maybe_save(step=step)
     assert calls == [10, 20, 30, 40]
+
+
+def test_save_final_dedupes_last_periodic_save(tmp_path: Path) -> None:
+    mgr = _make_manager(tmp_path, save_steps=10)
+    calls = _record_save_calls(mgr)
+    mgr.maybe_save(step=20)
+    mgr.save_final(step=20)
+    assert calls == [20]
+
+
+def test_save_final_writes_unsaved_last_step(tmp_path: Path) -> None:
+    mgr = _make_manager(tmp_path, save_steps=10)
+    calls = _record_save_calls(mgr)
+    mgr.maybe_save(step=20)
+    mgr.save_final(step=23)
+    assert calls == [20, 23]

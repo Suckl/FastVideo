@@ -45,6 +45,16 @@ from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 _RUN_ENV = "VIDAFORGE_RUN_MULTIBUCKET_TRAINING_INTEGRATION"
 _ENTRYPOINT_ENV = "VIDAFORGE_RUN_ENTRYPOINT_INTEGRATION"
 _WORLD_SIZE_ENV = "VIDAFORGE_INTEGRATION_WORLD_SIZE"
+_RECEIPT_DIR_ENV = "VIDAFORGE_ENTRYPOINT_RECEIPT_DIR"
+_RECEIPT_PHASE_ENV = "VIDAFORGE_ENTRYPOINT_RECEIPT_PHASE"
+_RECEIPT_MODEL_TARGET = (
+    "fastvideo.tests.workflow.vidaforge_entrypoint_receipt."
+    "VidaForgeEntrypointReceiptWanModel"
+)
+_RECEIPT_CALLBACK_TARGET = (
+    "fastvideo.tests.workflow.vidaforge_entrypoint_receipt."
+    "Section6ReceiptCallback"
+)
 _MODEL_NAME = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 _MODEL_REVISION = "0fad780a534b6463e45facd96134c9f345acfa5b"
 _VIDAFORGE_REVISION = "4562d3fbcbd4861fc74c2859950c0237363681bb"
@@ -573,9 +583,14 @@ def _run_entrypoint_phase(
     world_size: int,
     max_steps: int,
     resume_from_checkpoint: str | None,
+    receipt_dir: Path,
+    receipt_phase: str,
+    save_steps: int = 1,
 ) -> None:
     environment = dict(os.environ)
     environment["FASTVIDEO_ATTENTION_BACKEND"] = "TORCH_SDPA"
+    environment[_RECEIPT_DIR_ENV] = str(receipt_dir)
+    environment[_RECEIPT_PHASE_ENV] = receipt_phase
     environment.setdefault("TOKENIZERS_PARALLELISM", "false")
     environment.setdefault("WANDB_MODE", "disabled")
     command = [
@@ -588,8 +603,12 @@ def _run_entrypoint_phase(
         "fastvideo.train.entrypoint.train",
         "--config",
         str(_ENTRYPOINT_CONFIG),
+        "--models.student._target_",
+        _RECEIPT_MODEL_TARGET,
         "--models.student.init_from",
         str(model_root),
+        "--callbacks.section6_receipt._target_",
+        _RECEIPT_CALLBACK_TARGET,
         "--training.distributed.num_gpus",
         str(world_size),
         "--training.distributed.sp_size",
@@ -615,7 +634,7 @@ def _run_entrypoint_phase(
         "--training.checkpoint.output_dir",
         str(checkpoint_dir),
         "--training.checkpoint.training_state_checkpointing_steps",
-        "1",
+        str(save_steps),
         "--training.checkpoint.checkpoints_total_limit",
         "3",
         "--training.checkpoint.resume_from_checkpoint",
@@ -668,6 +687,7 @@ def _run_entrypoint_training_and_resume(
     checkpoint_dir: Path,
     provenance: dict[str, Any],
     world_size: int,
+    receipt_dir: Path,
 ) -> None:
     if world_size != 2:
         pytest.fail(
@@ -683,6 +703,8 @@ def _run_entrypoint_training_and_resume(
         world_size=world_size,
         max_steps=1,
         resume_from_checkpoint=None,
+        receipt_dir=receipt_dir,
+        receipt_phase="initial",
     )
     first_checkpoint = checkpoint_dir / "checkpoint-1"
     _assert_entrypoint_checkpoint(
@@ -706,6 +728,8 @@ def _run_entrypoint_training_and_resume(
         world_size=world_size,
         max_steps=2,
         resume_from_checkpoint="latest",
+        receipt_dir=receipt_dir,
+        receipt_phase="resumed",
     )
     assert _checkpoint_tree_fingerprint(
         first_checkpoint
@@ -716,6 +740,181 @@ def _run_entrypoint_training_and_resume(
         world_size=world_size,
         resume_from_checkpoint="latest",
     )
+
+    # A clean uninterrupted two-step run is the oracle for all state that
+    # matters at the entrypoint boundary. The instrumented Wan subclass only
+    # writes receipts; model construction and training still flow through the
+    # public YAML entrypoint.
+    _run_entrypoint_phase(
+        model_root=model_root,
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir.parent / "continuous-checkpoints",
+        provenance=provenance,
+        world_size=world_size,
+        max_steps=2,
+        resume_from_checkpoint=None,
+        receipt_dir=receipt_dir,
+        receipt_phase="continuous",
+    )
+    initial_batches: list[dict[str, Any]] = []
+    resumed_batches: list[dict[str, Any]] = []
+    initial_posts: list[dict[str, Any]] = []
+    resumed_posts: list[dict[str, Any]] = []
+    for rank in range(world_size):
+        initial_batch = _read_entrypoint_receipt(
+            receipt_dir,
+            phase="initial",
+            rank=rank,
+            kind="batch",
+            index=1,
+        )
+        resumed_batch = _read_entrypoint_receipt(
+            receipt_dir,
+            phase="resumed",
+            rank=rank,
+            kind="batch",
+            index=1,
+        )
+        continuous_first_batch = _read_entrypoint_receipt(
+            receipt_dir,
+            phase="continuous",
+            rank=rank,
+            kind="batch",
+            index=1,
+        )
+        continuous_second_batch = _read_entrypoint_receipt(
+            receipt_dir,
+            phase="continuous",
+            rank=rank,
+            kind="batch",
+            index=2,
+        )
+        _assert_entrypoint_batch_receipts_match(
+            initial_batch,
+            continuous_first_batch,
+        )
+        _assert_entrypoint_batch_receipts_match(
+            resumed_batch,
+            continuous_second_batch,
+        )
+        initial_batches.append(initial_batch)
+        resumed_batches.append(resumed_batch)
+        assert initial_batch["clip_ids"] != resumed_batch["clip_ids"]
+        assert initial_batch["bucket_frame_counts"] != (
+            resumed_batch["bucket_frame_counts"]
+        )
+        assert resumed_batch["dtensor_parameter_count"] > 0
+        assert resumed_batch["sharded_parameter_count"] > 0
+        assert any(
+            "Shard(" in placement
+            for example in resumed_batch["sharded_parameter_examples"]
+            for placement in example["placements"]
+        )
+
+        initial_post = _read_entrypoint_receipt(
+            receipt_dir,
+            phase="initial",
+            rank=rank,
+            kind="post-step",
+            index=1,
+        )
+        resumed_post = _read_entrypoint_receipt(
+            receipt_dir,
+            phase="resumed",
+            rank=rank,
+            kind="post-step",
+            index=2,
+        )
+        continuous_first_post = _read_entrypoint_receipt(
+            receipt_dir,
+            phase="continuous",
+            rank=rank,
+            kind="post-step",
+            index=1,
+        )
+        continuous_second_post = _read_entrypoint_receipt(
+            receipt_dir,
+            phase="continuous",
+            rank=rank,
+            kind="post-step",
+            index=2,
+        )
+        _assert_entrypoint_post_step_receipts_match(
+            initial_post,
+            continuous_first_post,
+        )
+        _assert_entrypoint_post_step_receipts_match(
+            resumed_post,
+            continuous_second_post,
+        )
+        initial_posts.append(initial_post)
+        resumed_posts.append(resumed_post)
+
+    # LoRA parameters use replicated DTensor placements and must begin and
+    # remain identical across data-parallel ranks.
+    assert len({
+        receipt["pre_step_trainable_model_sha256"]
+        for receipt in initial_batches
+    }) == 1
+    assert len({
+        receipt["pre_step_trainable_model_sha256"]
+        for receipt in resumed_batches
+    }) == 1
+    assert len({
+        receipt["trainable_model_sha256"]
+        for receipt in initial_posts
+    }) == 1
+    assert len({
+        receipt["trainable_model_sha256"]
+        for receipt in resumed_posts
+    }) == 1
+    assert len({
+        receipt["optimizer_sha256"]
+        for receipt in resumed_posts
+    }) == 1
+
+
+def _read_entrypoint_receipt(
+    receipt_dir: Path,
+    *,
+    phase: str,
+    rank: int,
+    kind: str,
+    index: int,
+) -> dict[str, Any]:
+    path = (
+        receipt_dir
+        / f"{phase}-rank-{rank:05d}-{kind}-{index:05d}.json"
+    )
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _assert_entrypoint_batch_receipts_match(
+    actual: dict[str, Any],
+    expected: dict[str, Any],
+) -> None:
+    for key in (
+        "clip_ids",
+        "bucket_frame_counts",
+        "bucket_resolutions",
+        "noise_sha256",
+        "timesteps_sha256",
+        "pre_step_trainable_model_sha256",
+    ):
+        assert actual[key] == expected[key]
+
+
+def _assert_entrypoint_post_step_receipts_match(
+    actual: dict[str, Any],
+    expected: dict[str, Any],
+) -> None:
+    for key in (
+        "iteration",
+        "trainable_model_sha256",
+        "optimizer_sha256",
+        "total_loss",
+    ):
+        assert actual[key] == expected[key]
 
 
 def test_entrypoint_phase_uses_documented_two_rank_fsdp_recipe(
@@ -742,6 +941,8 @@ def test_entrypoint_phase_uses_documented_two_rank_fsdp_recipe(
         world_size=2,
         max_steps=1,
         resume_from_checkpoint=None,
+        receipt_dir=tmp_path / "receipts",
+        receipt_phase="initial",
     )
 
     assert len(calls) == 1
@@ -751,6 +952,12 @@ def test_entrypoint_phase_uses_documented_two_rank_fsdp_recipe(
         return command[command.index(name) + 1]
 
     assert override_value("--config") == str(_ENTRYPOINT_CONFIG)
+    assert override_value("--models.student._target_") == (
+        _RECEIPT_MODEL_TARGET
+    )
+    assert override_value(
+        "--callbacks.section6_receipt._target_"
+    ) == _RECEIPT_CALLBACK_TARGET
     assert override_value("--training.distributed.num_gpus") == "2"
     assert override_value(
         "--training.distributed.hsdp_replicate_dim"
@@ -894,6 +1101,7 @@ def test_vidaforge_multibucket_producer_training_and_resume(
             checkpoint_dir=tmp_path / "entrypoint-checkpoints",
             provenance=provenance,
             world_size=world_size,
+            receipt_dir=tmp_path / "entrypoint-receipts",
         )
 
 
