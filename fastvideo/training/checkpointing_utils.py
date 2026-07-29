@@ -26,11 +26,15 @@ class ModelWrapper(torch.distributed.checkpoint.stateful.Stateful):
         filtered_state_dict = {name: value for name, value in state_dict.items() if name in trainable_parameters}
         # FSDP2's model state contains only parameters tracked when
         # ``fully_shard`` ran. Include trainable adapters attached afterwards
-        # so DCP receives their replicated DTensors as well.
+        # as plain local tensors. These parameters have Replicate placements,
+        # so every rank owns the full value; passing their DTensor wrappers to
+        # DCP can leave the load template unchanged even though metadata keys
+        # are present.
         for name, parameter in trainable_parameters.items():
+            local_parameter = (parameter.to_local() if isinstance(parameter, DTensor) else parameter)
             filtered_state_dict.setdefault(
                 name,
-                parameter.detach().clone(),
+                local_parameter.detach().clone(),
             )
 
         return filtered_state_dict
