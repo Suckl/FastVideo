@@ -860,17 +860,17 @@ def _run_entrypoint_training_and_resume(
             kind="post-step",
             index=2,
         )
-        _assert_entrypoint_post_step_receipts_match(
-            initial_post,
-            continuous_first_post,
-            label=f"rank {rank} initial vs continuous step 1",
-        )
         assert initial_post["trainable_model_sha256"] == (
             resumed_batch["pre_step_trainable_model_sha256"]
         ), f"rank {rank} checkpoint did not restore the saved LoRA state"
         assert continuous_first_post["trainable_model_sha256"] == (
             continuous_second_batch["pre_step_trainable_model_sha256"]
         ), f"rank {rank} checkpoint save mutated the live LoRA state"
+        _assert_entrypoint_post_step_receipts_match(
+            initial_post,
+            continuous_first_post,
+            label=f"rank {rank} initial vs continuous step 1",
+        )
         _assert_entrypoint_batch_receipts_match(
             resumed_batch,
             continuous_second_batch,
