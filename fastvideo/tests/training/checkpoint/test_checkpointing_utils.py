@@ -60,6 +60,8 @@ def test_model_wrapper_adds_trainable_params_missing_from_fsdp_state(
     assert set(state_dict) == {"layer.lora_A", "layer.lora_B"}
     assert torch.equal(state_dict["layer.lora_A"], model._lora_a)
     assert torch.equal(state_dict["layer.lora_B"], model._lora_b)
+    assert state_dict["layer.lora_A"].data_ptr() != model._lora_a.data_ptr()
+    assert state_dict["layer.lora_B"].data_ptr() != model._lora_b.data_ptr()
 
 
 def test_model_wrapper_explicitly_restores_trainable_params(monkeypatch):

@@ -28,7 +28,10 @@ class ModelWrapper(torch.distributed.checkpoint.stateful.Stateful):
         # ``fully_shard`` ran. Include trainable adapters attached afterwards
         # so DCP receives their replicated DTensors as well.
         for name, parameter in trainable_parameters.items():
-            filtered_state_dict.setdefault(name, parameter.detach())
+            filtered_state_dict.setdefault(
+                name,
+                parameter.detach().clone(),
+            )
 
         return filtered_state_dict
 
