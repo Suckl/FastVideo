@@ -792,10 +792,12 @@ def _run_entrypoint_training_and_resume(
         _assert_entrypoint_batch_receipts_match(
             initial_batch,
             continuous_first_batch,
+            label=f"rank {rank} initial vs continuous step 1",
         )
         _assert_entrypoint_batch_receipts_match(
             resumed_batch,
             continuous_second_batch,
+            label=f"rank {rank} resumed vs continuous step 2",
         )
         initial_batches.append(initial_batch)
         resumed_batches.append(resumed_batch)
@@ -842,10 +844,12 @@ def _run_entrypoint_training_and_resume(
         _assert_entrypoint_post_step_receipts_match(
             initial_post,
             continuous_first_post,
+            label=f"rank {rank} initial vs continuous step 1",
         )
         _assert_entrypoint_post_step_receipts_match(
             resumed_post,
             continuous_second_post,
+            label=f"rank {rank} resumed vs continuous step 2",
         )
         initial_posts.append(initial_post)
         resumed_posts.append(resumed_post)
@@ -892,29 +896,47 @@ def _read_entrypoint_receipt(
 def _assert_entrypoint_batch_receipts_match(
     actual: dict[str, Any],
     expected: dict[str, Any],
+    *,
+    label: str,
 ) -> None:
-    for key in (
+    keys = (
         "clip_ids",
         "bucket_frame_counts",
         "bucket_resolutions",
         "noise_sha256",
         "timesteps_sha256",
         "pre_step_trainable_model_sha256",
-    ):
-        assert actual[key] == expected[key]
+    )
+    mismatches = {
+        key: {"actual": actual[key], "expected": expected[key]}
+        for key in keys
+        if actual[key] != expected[key]
+    }
+    assert not mismatches, (
+        f"{label}: {json.dumps(mismatches, sort_keys=True)}"
+    )
 
 
 def _assert_entrypoint_post_step_receipts_match(
     actual: dict[str, Any],
     expected: dict[str, Any],
+    *,
+    label: str,
 ) -> None:
-    for key in (
+    keys = (
         "iteration",
         "trainable_model_sha256",
         "optimizer_sha256",
         "total_loss",
-    ):
-        assert actual[key] == expected[key]
+    )
+    mismatches = {
+        key: {"actual": actual[key], "expected": expected[key]}
+        for key in keys
+        if actual[key] != expected[key]
+    }
+    assert not mismatches, (
+        f"{label}: {json.dumps(mismatches, sort_keys=True)}"
+    )
 
 
 def test_entrypoint_phase_uses_documented_two_rank_fsdp_recipe(
