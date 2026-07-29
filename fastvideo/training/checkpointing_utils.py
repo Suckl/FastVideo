@@ -17,12 +17,17 @@ class ModelWrapper(torch.distributed.checkpoint.stateful.Stateful):
     def state_dict(self) -> dict[str, Any]:
         state_dict = get_model_state_dict(self.model)
 
-        param_requires_grad = {
-            k.replace("._checkpoint_wrapped_module.", ".")
-            for k, v in self.model.named_parameters() if v.requires_grad
+        trainable_parameters = {
+            name.replace("._checkpoint_wrapped_module.", "."): parameter
+            for name, parameter in self.model.named_parameters() if parameter.requires_grad
         }
 
-        filtered_state_dict = {k: v for k, v in state_dict.items() if k in param_requires_grad}
+        filtered_state_dict = {name: value for name, value in state_dict.items() if name in trainable_parameters}
+        # FSDP2's model state contains only parameters tracked when
+        # ``fully_shard`` ran. Include trainable adapters attached afterwards
+        # so DCP receives their replicated DTensors as well.
+        for name, parameter in trainable_parameters.items():
+            filtered_state_dict.setdefault(name, parameter.detach())
 
         return filtered_state_dict
 

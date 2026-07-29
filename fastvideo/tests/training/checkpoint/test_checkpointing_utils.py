@@ -45,6 +45,23 @@ def test_model_wrapper_filters_wrapped_trainable_params(monkeypatch):
     assert "layer.frozen_weight" not in filtered_state_dict
 
 
+def test_model_wrapper_adds_trainable_params_missing_from_fsdp_state(
+        monkeypatch):
+    """Save adapters attached after FSDP2 recorded its parameter set."""
+    model = DummyWrappedModule()
+    wrapper = ModelWrapper(model)
+
+    monkeypatch.setattr(
+        "fastvideo.training.checkpointing_utils.get_model_state_dict",
+        lambda _model: {},
+    )
+    state_dict = wrapper.state_dict()
+
+    assert set(state_dict) == {"layer.lora_A", "layer.lora_B"}
+    assert torch.equal(state_dict["layer.lora_A"], model._lora_a)
+    assert torch.equal(state_dict["layer.lora_B"], model._lora_b)
+
+
 def test_model_wrapper_explicitly_restores_trainable_params(monkeypatch):
     """Restore adapters that FSDP2 did not track when it was wrapped."""
     model = DummyWrappedModule()
