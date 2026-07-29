@@ -521,6 +521,32 @@ checkpoint manager directly. It does not invoke the YAML training entrypoint
 or independently test HSDP/FSDP gradient synchronization, which remain covered
 by the modular trainer's distributed test lanes.
 
+Section 6 adds the real user-facing YAML boundary to that two-GPU gate. Set
+the additional environment variable below to launch
+`fastvideo.train.entrypoint.train` from the documented
+`vidaforge_automodel_t2v_lora.yaml` recipe with a `1 x 2` HSDP mesh (one
+replica dimension and two FSDP shards):
+
+```bash
+VIDAFORGE_RUN_MULTIBUCKET_TRAINING_INTEGRATION=1 \
+VIDAFORGE_RUN_ENTRYPOINT_INTEGRATION=1 \
+VIDAFORGE_INTEGRATION_WORLD_SIZE=2 \
+VIDAFORGE_REFERENCE_DIR=/tmp/VidaForge \
+pytest \
+    fastvideo/tests/workflow/test_vidaforge_multibucket_training_integration.py \
+    -vs
+```
+
+The first entrypoint process trains step 1 and writes `checkpoint-1`. A fresh
+two-rank process then resolves `resume_from_checkpoint: latest`, restores the
+sharded model, optimizer, dataloader, callback, and per-rank RNG state, trains
+step 2 from the remaining bucket, and writes `checkpoint-2`. The gate verifies
+the resolved HSDP settings in checkpoint metadata and checks that the second
+process did not rewrite `checkpoint-1`; a non-resumed two-step run would do so.
+Together with Section 5's exact per-rank batch, noise, timestep, and bucket
+assertions, this covers both the low-level resume contract and the actual
+documented launch path.
+
 ## Creating Your Own Dataset
 
 If you have raw videos and captions in separate files, generate the `videos2caption.json`:

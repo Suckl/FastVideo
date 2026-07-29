@@ -8,14 +8,17 @@ one short landscape clip and one longer portrait clip. It exercises:
 * tensor parity with the pinned VidaForge Wan AutoModel encoder;
 * the real bucketed training loader, Wan 1.3B, and ``FineTuneMethod``;
 * a forward/loss/backward/optimizer step with only ``proj_out`` trainable; and
-* ``CheckpointManager`` model, optimizer, and dataloader state restoration.
+* ``CheckpointManager`` model, optimizer, and dataloader state restoration;
+* the public YAML training entrypoint with two-rank FSDP sharding; and
+* a fresh entrypoint process resuming from ``latest`` into the next bucket.
 
 Set ``VIDAFORGE_RUN_MULTIBUCKET_TRAINING_INTEGRATION=1`` and point
 ``VIDAFORGE_REFERENCE_DIR`` at VidaForge commit
 ``4562d3fbcbd4861fc74c2859950c0237363681bb`` to run it. The default test is
 sized for one Modal L40S; set ``VIDAFORGE_INTEGRATION_WORLD_SIZE=2`` for the
-Section 5 distributed gate on two GPUs. It is skipped during ordinary CPU
-test runs.
+Section 5 distributed gate on two GPUs. Also set
+``VIDAFORGE_RUN_ENTRYPOINT_INTEGRATION=1`` for the Section 6 YAML/FSDP gate.
+It is skipped during ordinary CPU test runs.
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 
 _RUN_ENV = "VIDAFORGE_RUN_MULTIBUCKET_TRAINING_INTEGRATION"
+_ENTRYPOINT_ENV = "VIDAFORGE_RUN_ENTRYPOINT_INTEGRATION"
 _WORLD_SIZE_ENV = "VIDAFORGE_INTEGRATION_WORLD_SIZE"
 _MODEL_NAME = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 _MODEL_REVISION = "0fad780a534b6463e45facd96134c9f345acfa5b"
@@ -52,6 +56,15 @@ _FIXTURE = (
     / "train"
     / "fixtures"
     / "wan_t2v_finetune_min.yaml"
+)
+_ENTRYPOINT_CONFIG = (
+    Path(__file__).resolve().parents[3]
+    / "examples"
+    / "train"
+    / "configs"
+    / "fine_tuning"
+    / "wan"
+    / "vidaforge_automodel_t2v_lora.yaml"
 )
 
 
@@ -532,6 +545,225 @@ def _run_training_worker(
     )
 
 
+def _checkpoint_tree_fingerprint(checkpoint_dir: Path) -> str:
+    digest = hashlib.sha256()
+    files = sorted(
+        path
+        for path in checkpoint_dir.rglob("*")
+        if path.is_file()
+    )
+    assert files
+    for path in files:
+        digest.update(
+            path.relative_to(checkpoint_dir).as_posix().encode("utf-8")
+        )
+        digest.update(b"\0")
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _run_entrypoint_phase(
+    *,
+    model_root: Path,
+    cache_dir: Path,
+    checkpoint_dir: Path,
+    provenance: dict[str, Any],
+    world_size: int,
+    max_steps: int,
+    resume_from_checkpoint: str | None,
+) -> None:
+    environment = dict(os.environ)
+    environment["FASTVIDEO_ATTENTION_BACKEND"] = "TORCH_SDPA"
+    environment.setdefault("TOKENIZERS_PARALLELISM", "false")
+    environment.setdefault("WANDB_MODE", "disabled")
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        f"--nproc-per-node={world_size}",
+        "-m",
+        "fastvideo.train.entrypoint.train",
+        "--config",
+        str(_ENTRYPOINT_CONFIG),
+        "--models.student.init_from",
+        str(model_root),
+        "--training.distributed.num_gpus",
+        str(world_size),
+        "--training.distributed.sp_size",
+        "1",
+        "--training.distributed.tp_size",
+        "1",
+        "--training.distributed.hsdp_replicate_dim",
+        "1",
+        "--training.distributed.hsdp_shard_dim",
+        str(world_size),
+        "--training.data.data_path",
+        str(cache_dir),
+        "--training.data.vidaforge_model_name",
+        _MODEL_NAME,
+        "--training.data.vidaforge_vae_fingerprint",
+        str(provenance["vae_fingerprint"]),
+        "--training.data.vidaforge_text_encoder_fingerprint",
+        str(provenance["text_encoder_fingerprint"]),
+        "--training.data.dataloader_num_workers",
+        "0",
+        "--training.loop.max_train_steps",
+        str(max_steps),
+        "--training.checkpoint.output_dir",
+        str(checkpoint_dir),
+        "--training.checkpoint.training_state_checkpointing_steps",
+        "1",
+        "--training.checkpoint.checkpoints_total_limit",
+        "3",
+        "--training.checkpoint.resume_from_checkpoint",
+        (
+            resume_from_checkpoint
+            if resume_from_checkpoint is not None
+            else "null"
+        ),
+    ]
+    subprocess.run(
+        command,
+        check=True,
+        timeout=_timeout_seconds(),
+        env=environment,
+    )
+
+
+def _assert_entrypoint_checkpoint(
+    checkpoint_dir: Path,
+    *,
+    step: int,
+    world_size: int,
+    resume_from_checkpoint: str | None,
+) -> None:
+    assert (checkpoint_dir / "dcp").is_dir()
+    for rank in range(world_size):
+        assert (checkpoint_dir / f"rng_state_rank{rank}.pt").is_file()
+
+    metadata = json.loads(
+        (checkpoint_dir / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert metadata["step"] == step
+    raw_config = metadata["config"]
+    distributed = raw_config["training"]["distributed"]
+    assert distributed["num_gpus"] == world_size
+    assert distributed["sp_size"] == 1
+    assert distributed["tp_size"] == 1
+    assert distributed["hsdp_replicate_dim"] == 1
+    assert distributed["hsdp_shard_dim"] == world_size
+    checkpoint_config = raw_config["training"]["checkpoint"]
+    assert checkpoint_config["resume_from_checkpoint"] == (
+        resume_from_checkpoint
+    )
+
+
+def _run_entrypoint_training_and_resume(
+    *,
+    model_root: Path,
+    cache_dir: Path,
+    checkpoint_dir: Path,
+    provenance: dict[str, Any],
+    world_size: int,
+) -> None:
+    if world_size != 2:
+        pytest.fail(
+            f"{_ENTRYPOINT_ENV}=1 requires exactly two GPUs so the gate "
+            "exercises two-rank FSDP sharding"
+        )
+
+    _run_entrypoint_phase(
+        model_root=model_root,
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        provenance=provenance,
+        world_size=world_size,
+        max_steps=1,
+        resume_from_checkpoint=None,
+    )
+    first_checkpoint = checkpoint_dir / "checkpoint-1"
+    _assert_entrypoint_checkpoint(
+        first_checkpoint,
+        step=1,
+        world_size=world_size,
+        resume_from_checkpoint=None,
+    )
+    first_checkpoint_fingerprint = _checkpoint_tree_fingerprint(
+        first_checkpoint
+    )
+
+    # Start a new torchrun process. A fresh two-step run would save and
+    # overwrite checkpoint-1; preserving it proves that ``latest`` resumed at
+    # step 1 and executed only the next bucket before writing checkpoint-2.
+    _run_entrypoint_phase(
+        model_root=model_root,
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        provenance=provenance,
+        world_size=world_size,
+        max_steps=2,
+        resume_from_checkpoint="latest",
+    )
+    assert _checkpoint_tree_fingerprint(
+        first_checkpoint
+    ) == first_checkpoint_fingerprint
+    _assert_entrypoint_checkpoint(
+        checkpoint_dir / "checkpoint-2",
+        step=2,
+        world_size=world_size,
+        resume_from_checkpoint="latest",
+    )
+
+
+def test_entrypoint_phase_uses_documented_two_rank_fsdp_recipe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def fake_run(
+        command: list[str],
+        **kwargs: Any,
+    ) -> None:
+        calls.append((command, kwargs))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    _run_entrypoint_phase(
+        model_root=tmp_path / "model",
+        cache_dir=tmp_path / "cache",
+        checkpoint_dir=tmp_path / "checkpoints",
+        provenance={
+            "vae_fingerprint": "a" * 64,
+            "text_encoder_fingerprint": "b" * 64,
+        },
+        world_size=2,
+        max_steps=1,
+        resume_from_checkpoint=None,
+    )
+
+    assert len(calls) == 1
+    command, kwargs = calls[0]
+
+    def override_value(name: str) -> str:
+        return command[command.index(name) + 1]
+
+    assert override_value("--config") == str(_ENTRYPOINT_CONFIG)
+    assert override_value("--training.distributed.num_gpus") == "2"
+    assert override_value(
+        "--training.distributed.hsdp_replicate_dim"
+    ) == "1"
+    assert override_value("--training.distributed.hsdp_shard_dim") == "2"
+    assert override_value("--training.loop.max_train_steps") == "1"
+    assert override_value(
+        "--training.checkpoint.resume_from_checkpoint"
+    ) == "null"
+    assert kwargs["check"] is True
+    assert kwargs["env"]["FASTVIDEO_ATTENTION_BACKEND"] == "TORCH_SDPA"
+
+
 @pytest.mark.skipif(
     os.environ.get(_RUN_ENV) != "1",
     reason=f"set {_RUN_ENV}=1 to run the producer-to-training GPU test",
@@ -654,6 +886,15 @@ def test_vidaforge_multibucket_producer_training_and_resume(
         assert result["loss"] >= 0
         assert math.isfinite(result["resumed_loss"])
         assert result["resumed_loss"] >= 0
+
+    if os.environ.get(_ENTRYPOINT_ENV) == "1":
+        _run_entrypoint_training_and_resume(
+            model_root=model_root,
+            cache_dir=output_dir,
+            checkpoint_dir=tmp_path / "entrypoint-checkpoints",
+            provenance=provenance,
+            world_size=world_size,
+        )
 
 
 def _rank_result_path(path: Path, rank: int) -> Path:
