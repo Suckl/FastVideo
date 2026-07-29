@@ -7,6 +7,7 @@ import torch
 import torch.distributed.checkpoint.stateful
 from torch.distributed.checkpoint.state_dict import (StateDictOptions, get_model_state_dict, get_optimizer_state_dict,
                                                      set_model_state_dict, set_optimizer_state_dict)
+from torch.distributed.tensor import DTensor
 
 
 class ModelWrapper(torch.distributed.checkpoint.stateful.Stateful):
@@ -48,7 +49,9 @@ class ModelWrapper(torch.distributed.checkpoint.stateful.Stateful):
             for name, value in state_dict.items():
                 parameter = named_trainable_parameters.get(name)
                 if parameter is not None:
-                    parameter.copy_(value)
+                    destination = (parameter.to_local() if isinstance(parameter, DTensor) else parameter)
+                    source = (value.to_local() if isinstance(value, DTensor) else value)
+                    destination.copy_(source)
         set_model_state_dict(
             self.model,
             model_state_dict=state_dict,
