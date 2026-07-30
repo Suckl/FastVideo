@@ -1101,10 +1101,11 @@ _DTYPE_TOLERANCES = {
     torch.float64: (1e-7, 1e-7),
     torch.float32: (1.3e-6, 1e-5),
     torch.float16: (1e-3, 1e-5),
-    # Independent CUDA launches showed sparse (~0.2%) BF16 near-zero drift
-    # up to 1.97e-5. Keep the standard BF16 relative tolerance and allow
-    # 3e-5 absolute headroom without relaxing any same-run hash invariant.
-    torch.bfloat16: (1.6e-2, 3e-5),
+    # Independent CUDA launches showed sparse BF16 near-zero drift: up to
+    # 1.97e-5 after one step and 3.34e-5 in 7/24576 elements after two
+    # steps. Keep the standard BF16 relative tolerance and allow 5e-5
+    # absolute headroom without relaxing any same-run hash invariant.
+    torch.bfloat16: (1.6e-2, 5e-5),
 }
 
 
@@ -1224,7 +1225,7 @@ def test_entrypoint_state_snapshot_oracle_is_tensorwise_and_tolerant() -> None:
     bf16_actual = {
         "model": {
             "layer.lora_A": torch.tensor(
-                [2e-5, 0.0],
+                [4e-5, 0.0],
                 dtype=torch.bfloat16,
             ),
         },
