@@ -7,7 +7,7 @@ import torch
 import torch.distributed.checkpoint.stateful
 from torch.distributed.checkpoint.state_dict import (StateDictOptions, get_model_state_dict, get_optimizer_state_dict,
                                                      set_model_state_dict, set_optimizer_state_dict)
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate
 
 
 class ModelWrapper(torch.distributed.checkpoint.stateful.Stateful):
@@ -24,18 +24,19 @@ class ModelWrapper(torch.distributed.checkpoint.stateful.Stateful):
         }
 
         filtered_state_dict = {name: value for name, value in state_dict.items() if name in trainable_parameters}
-        # FSDP2's model state contains only parameters tracked when
-        # ``fully_shard`` ran. Include trainable adapters attached afterwards
-        # as plain local tensors. These parameters have Replicate placements,
-        # so every rank owns the full value; passing their DTensor wrappers to
-        # DCP can leave the load template unchanged even though metadata keys
-        # are present.
+        # LoRA adapters added after ``fully_shard`` are replicated DTensors,
+        # but they are not managed by FSDP.  ``get_model_state_dict`` still
+        # exposes them, so using ``setdefault`` here would retain those
+        # unmanaged DTensors and DCP would build its load template from them.
+        # Always serialize fully-replicated trainables as independent local
+        # tensors.  Keep normal FSDP Shard parameters untouched so DCP can
+        # preserve their global layout.
         for name, parameter in trainable_parameters.items():
-            local_parameter = (parameter.to_local() if isinstance(parameter, DTensor) else parameter)
-            filtered_state_dict.setdefault(
-                name,
-                local_parameter.detach().clone(),
-            )
+            if isinstance(parameter, DTensor) and all(
+                    isinstance(placement, Replicate) for placement in parameter.placements):
+                filtered_state_dict[name] = parameter.to_local().detach().clone()
+            elif name not in filtered_state_dict:
+                filtered_state_dict[name] = parameter.detach().clone()
 
         return filtered_state_dict
 

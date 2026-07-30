@@ -15,6 +15,7 @@ from torch.distributed.tensor import DTensor
 from fastvideo.pipelines import TrainingBatch
 from fastvideo.train.callbacks.callback import Callback
 from fastvideo.train.models.wan import WanModel
+from fastvideo.training.checkpointing_utils import ModelWrapper
 
 _RECEIPT_DIR_ENV = "VIDAFORGE_ENTRYPOINT_RECEIPT_DIR"
 _RECEIPT_PHASE_ENV = "VIDAFORGE_ENTRYPOINT_RECEIPT_PHASE"
@@ -61,12 +62,52 @@ def _update_tensor_digest(
 
 def _trainable_model_digest(model: WanModel) -> str:
     digest = hashlib.sha256()
-    for name, parameter in model.transformer.named_parameters():
-        if parameter.requires_grad:
+    parameters = {
+        name.replace(
+            "._checkpoint_wrapped_module.",
+            ".",
+        ): parameter
+        for name, parameter in model.transformer.named_parameters()
+        if parameter.requires_grad
+    }
+    for name in sorted(parameters):
+        _update_tensor_digest(
+            digest,
+            name=name,
+            tensor=parameters[name],
+        )
+    return digest.hexdigest()
+
+
+def _model_wrapper_trainable_digest(model: torch.nn.Module) -> str:
+    digest = hashlib.sha256()
+    parameters = {
+        name.replace(
+            "._checkpoint_wrapped_module.",
+            ".",
+        ): parameter
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    for name in sorted(parameters):
+        _update_tensor_digest(
+            digest,
+            name=name,
+            tensor=parameters[name],
+        )
+    return digest.hexdigest()
+
+
+def _checkpoint_model_state_digest(
+    state_dict: dict[str, Any],
+) -> str:
+    digest = hashlib.sha256()
+    for name, value in sorted(state_dict.items()):
+        if isinstance(value, torch.Tensor):
             _update_tensor_digest(
                 digest,
                 name=name,
-                tensor=parameter,
+                tensor=value,
             )
     return digest.hexdigest()
 
@@ -211,3 +252,61 @@ class Section6ReceiptCallback(Callback):
             json.dumps(receipt, sort_keys=True),
             encoding="utf-8",
         )
+
+
+_ORIGINAL_MODEL_WRAPPER_STATE_DICT = ModelWrapper.state_dict
+_ORIGINAL_MODEL_WRAPPER_LOAD_STATE_DICT = ModelWrapper.load_state_dict
+_MODEL_WRAPPER_STATE_DICT_INDEX = 0
+
+
+def _observed_model_wrapper_state_dict(
+    wrapper: ModelWrapper,
+) -> dict[str, Any]:
+    """Expose the exact save/load template produced by ``ModelWrapper``."""
+
+    global _MODEL_WRAPPER_STATE_DICT_INDEX
+    before_digest = _model_wrapper_trainable_digest(wrapper.model)
+    state_dict = _ORIGINAL_MODEL_WRAPPER_STATE_DICT(wrapper)
+    after_digest = _model_wrapper_trainable_digest(wrapper.model)
+    _MODEL_WRAPPER_STATE_DICT_INDEX += 1
+    receipt = {
+        "rank": _rank(),
+        "state_keys": sorted(state_dict),
+        "before_model_sha256": before_digest,
+        "after_model_sha256": after_digest,
+        "payload_sha256": _checkpoint_model_state_digest(state_dict),
+    }
+    _receipt_path(
+        "checkpoint-state-dict",
+        _MODEL_WRAPPER_STATE_DICT_INDEX,
+    ).write_text(
+        json.dumps(receipt, sort_keys=True),
+        encoding="utf-8",
+    )
+    return state_dict
+
+
+def _observed_model_wrapper_load_state_dict(
+    wrapper: ModelWrapper,
+    state_dict: dict[str, Any],
+) -> None:
+    """Expose the DCP payload and post-load value for Section 6 diagnosis."""
+
+    payload_digest = _checkpoint_model_state_digest(state_dict)
+    _ORIGINAL_MODEL_WRAPPER_LOAD_STATE_DICT(wrapper, state_dict)
+    receipt = {
+        "rank": _rank(),
+        "state_keys": sorted(state_dict),
+        "payload_sha256": payload_digest,
+        "restored_model_sha256": _model_wrapper_trainable_digest(
+            wrapper.model
+        ),
+    }
+    _receipt_path("checkpoint-load", 0).write_text(
+        json.dumps(receipt, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+ModelWrapper.state_dict = _observed_model_wrapper_state_dict
+ModelWrapper.load_state_dict = _observed_model_wrapper_load_state_dict

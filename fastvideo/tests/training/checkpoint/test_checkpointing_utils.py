@@ -1,5 +1,10 @@
 import torch
+import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
+import pytest
 from torch import nn
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Replicate
 
 from fastvideo.training.checkpointing_utils import ModelWrapper
 
@@ -95,3 +100,78 @@ def test_model_wrapper_explicitly_restores_trainable_params(monkeypatch):
     assert torch.equal(model._lora_a, expected_lora_a)
     assert torch.equal(model._lora_b, expected_lora_b)
     assert torch.equal(model._frozen, torch.tensor([5.0, 6.0]))
+
+
+def test_model_wrapper_dcp_round_trip_overrides_unmanaged_replicated_dtensor(
+    monkeypatch,
+    tmp_path,
+):
+    """DCP must materialize and restore a late replicated adapter."""
+    if dist.is_initialized():
+        pytest.skip("requires ownership of the default process group")
+
+    rendezvous = (tmp_path / "dtensor-rendezvous").as_posix()
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file:///{rendezvous}",
+        rank=0,
+        world_size=1,
+    )
+    try:
+        mesh = init_device_mesh("cpu", (1,))
+        model = DummyWrappedModule()
+        current = DTensor.from_local(
+            torch.tensor([7.0, 8.0]),
+            device_mesh=mesh,
+            placements=[Replicate()],
+        )
+        model._lora_a = nn.Parameter(current)
+        stale = DTensor.from_local(
+            torch.tensor([-1.0, -2.0]),
+            device_mesh=mesh,
+            placements=[Replicate()],
+        )
+
+        monkeypatch.setattr(
+            "fastvideo.training.checkpointing_utils.get_model_state_dict",
+            lambda _model: {
+                "layer.lora_A": stale,
+                "layer.lora_B": model._lora_b,
+            },
+        )
+
+        state_dict = ModelWrapper(model).state_dict()
+
+        assert not isinstance(state_dict["layer.lora_A"], DTensor)
+        assert torch.equal(
+            state_dict["layer.lora_A"],
+            torch.tensor([7.0, 8.0]),
+        )
+        assert state_dict["layer.lora_A"].data_ptr() != (
+            model._lora_a.to_local().data_ptr()
+        )
+
+        monkeypatch.setattr(
+            "fastvideo.training.checkpointing_utils.set_model_state_dict",
+            lambda *_args, **_kwargs: None,
+        )
+        wrapper = ModelWrapper(model)
+        checkpoint_dir = tmp_path / "dcp"
+        dcp.save(
+            {"model": wrapper},
+            checkpoint_id=str(checkpoint_dir),
+        )
+        with torch.no_grad():
+            model._lora_a.to_local().zero_()
+
+        dcp.load(
+            {"model": wrapper},
+            checkpoint_id=str(checkpoint_dir),
+        )
+
+        assert torch.equal(
+            model._lora_a.to_local(),
+            torch.tensor([7.0, 8.0]),
+        )
+    finally:
+        dist.destroy_process_group()

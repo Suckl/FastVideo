@@ -860,6 +860,50 @@ def _run_entrypoint_training_and_resume(
             kind="post-step",
             index=2,
         )
+        checkpoint_save = _read_entrypoint_receipt(
+            receipt_dir,
+            phase="initial",
+            rank=rank,
+            kind="checkpoint-state-dict",
+            index=1,
+        )
+        assert initial_post["trainable_model_sha256"] == (
+            checkpoint_save["before_model_sha256"]
+        ), (
+            f"rank {rank} model changed before checkpoint state capture: "
+            f"{json.dumps(checkpoint_save, sort_keys=True)}"
+        )
+        assert checkpoint_save["before_model_sha256"] == (
+            checkpoint_save["after_model_sha256"]
+        ), (
+            f"rank {rank} checkpoint state capture mutated the LoRA model: "
+            f"{json.dumps(checkpoint_save, sort_keys=True)}"
+        )
+        assert initial_post["trainable_model_sha256"] == (
+            checkpoint_save["payload_sha256"]
+        ), (
+            f"rank {rank} checkpoint state capture did not snapshot LoRA: "
+            f"{json.dumps(checkpoint_save, sort_keys=True)}"
+        )
+        checkpoint_load = _read_entrypoint_receipt(
+            receipt_dir,
+            phase="resumed",
+            rank=rank,
+            kind="checkpoint-load",
+            index=0,
+        )
+        assert initial_post["trainable_model_sha256"] == (
+            checkpoint_load["payload_sha256"]
+        ), (
+            f"rank {rank} DCP did not materialize the saved LoRA payload: "
+            f"{json.dumps(checkpoint_load, sort_keys=True)}"
+        )
+        assert checkpoint_load["payload_sha256"] == (
+            checkpoint_load["restored_model_sha256"]
+        ), (
+            f"rank {rank} ModelWrapper did not write the materialized LoRA "
+            f"payload: {json.dumps(checkpoint_load, sort_keys=True)}"
+        )
         assert initial_post["trainable_model_sha256"] == (
             resumed_batch["pre_step_trainable_model_sha256"]
         ), f"rank {rank} checkpoint did not restore the saved LoRA state"
