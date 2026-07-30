@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import io
 import random
 from typing import Any
 
@@ -8,6 +9,22 @@ import torch.distributed.checkpoint.stateful
 from torch.distributed.checkpoint.state_dict import (StateDictOptions, get_model_state_dict, get_optimizer_state_dict,
                                                      set_model_state_dict, set_optimizer_state_dict)
 from torch.distributed.tensor import DTensor, Replicate
+
+_REPLICATED_TENSOR_STATE_PREFIX = "__fastvideo_replicated_tensor__."
+
+
+def _serialize_replicated_tensor(tensor: DTensor) -> bytes:
+    buffer = io.BytesIO()
+    torch.save(tensor.to_local().detach().cpu(), buffer)
+    return buffer.getvalue()
+
+
+def _deserialize_replicated_tensor(payload: bytes) -> torch.Tensor:
+    return torch.load(
+        io.BytesIO(payload),
+        map_location="cpu",
+        weights_only=True,
+    )
 
 
 class ModelWrapper(torch.distributed.checkpoint.stateful.Stateful):
@@ -28,15 +45,18 @@ class ModelWrapper(torch.distributed.checkpoint.stateful.Stateful):
         # but they are not managed by FSDP.  ``get_model_state_dict`` still
         # exposes them, so using ``setdefault`` here would retain those
         # unmanaged DTensors and DCP would build its load template from them.
-        # Always serialize fully-replicated trainables as independent
-        # DTensors. DCP needs their mesh/placements to materialize the payload
-        # on every rank; a plain local tensor template is not sufficient in a
-        # multi-rank load. Keep normal FSDP Shard parameters untouched so DCP
-        # can preserve their global layout.
+        # The default CUDA DCP tensor planner does not reliably materialize
+        # these unmanaged, fully-replicated DTensors on a multi-dimensional
+        # HSDP mesh. Store each one as a named DCP byte object instead. This
+        # remains part of the DCP checkpoint and preserves the adapter name in
+        # metadata, while avoiding tensor-planner assumptions intended for
+        # FSDP-managed state. Keep normal Shard parameters untouched.
         for name, parameter in trainable_parameters.items():
             if isinstance(parameter, DTensor) and all(
                     isinstance(placement, Replicate) for placement in parameter.placements):
-                filtered_state_dict[name] = parameter.detach().clone()
+                filtered_state_dict.pop(name, None)
+                filtered_state_dict[f"{_REPLICATED_TENSOR_STATE_PREFIX}{name}"] = (
+                    _serialize_replicated_tensor(parameter))
             elif name not in filtered_state_dict:
                 filtered_state_dict[name] = parameter.detach().clone()
 
@@ -53,18 +73,29 @@ class ModelWrapper(torch.distributed.checkpoint.stateful.Stateful):
         }
         replicated_trainable_parameters = {
             name: parameter
-            for name, parameter in named_trainable_parameters.items()
-            if isinstance(parameter, DTensor) and all(
-                isinstance(placement, Replicate)
-                for placement in parameter.placements)
+            for name, parameter in named_trainable_parameters.items() if isinstance(parameter, DTensor) and all(
+                isinstance(placement, Replicate) for placement in parameter.placements)
         }
-        saved_trainable_parameters = {
+        # Normal keys support checkpoints written by the earlier DTensor
+        # representation. New checkpoints use the byte-object prefix below.
+        saved_trainable_parameters: dict[str, torch.Tensor] = {
             name: value.detach().clone()
             for name, value in state_dict.items() if name in replicated_trainable_parameters
         }
+        for key, payload in state_dict.items():
+            if not key.startswith(_REPLICATED_TENSOR_STATE_PREFIX):
+                continue
+            name = key[len(_REPLICATED_TENSOR_STATE_PREFIX):]
+            if name not in replicated_trainable_parameters:
+                continue
+            if not isinstance(payload, bytes):
+                raise TypeError(f"Expected bytes for replicated tensor checkpoint {name!r}, "
+                                f"got {type(payload).__name__}")
+            saved_trainable_parameters[name] = (_deserialize_replicated_tensor(payload))
         fsdp_state_dict = {
             name: value
-            for name, value in state_dict.items() if name not in replicated_trainable_parameters
+            for name, value in state_dict.items()
+            if name not in replicated_trainable_parameters and not name.startswith(_REPLICATED_TENSOR_STATE_PREFIX)
         }
         set_model_state_dict(
             self.model,

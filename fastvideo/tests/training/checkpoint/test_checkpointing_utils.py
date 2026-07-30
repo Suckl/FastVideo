@@ -7,7 +7,11 @@ from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate
 
-from fastvideo.training.checkpointing_utils import ModelWrapper
+from fastvideo.training.checkpointing_utils import (
+    ModelWrapper,
+    _deserialize_replicated_tensor,
+    _REPLICATED_TENSOR_STATE_PREFIX,
+)
 
 
 class DummyWrappedModule(nn.Module):
@@ -36,28 +40,36 @@ def _two_rank_replicated_adapter_dcp_worker(
         world_size=2,
     )
     try:
-        mesh = init_device_mesh("cpu", (2,))
+        mesh = init_device_mesh(
+            "cpu",
+            (1, 2),
+            mesh_dim_names=("replicate", "shard"),
+        )
         model = nn.Module()
         model.layer = nn.Module()
         model.layer.lora_A = nn.Parameter(
             DTensor.from_local(
                 torch.tensor([7.0, 8.0]),
                 device_mesh=mesh,
-                placements=[Replicate()],
+                placements=[Replicate(), Replicate()],
             )
         )
         model.layer.lora_B = nn.Parameter(
             DTensor.from_local(
                 torch.tensor([9.0, 10.0]),
                 device_mesh=mesh,
-                placements=[Replicate()],
+                placements=[Replicate(), Replicate()],
             )
         )
         wrapper = ModelWrapper(model)
         state_dict = wrapper.state_dict()
-        assert isinstance(state_dict["layer.lora_A"], DTensor)
-        assert state_dict["layer.lora_A"].to_local().data_ptr() != (
-            model.layer.lora_A.to_local().data_ptr()
+        lora_a_key = (
+            f"{_REPLICATED_TENSOR_STATE_PREFIX}layer.lora_A"
+        )
+        assert isinstance(state_dict[lora_a_key], bytes)
+        assert torch.equal(
+            _deserialize_replicated_tensor(state_dict[lora_a_key]),
+            torch.tensor([7.0, 8.0]),
         )
 
         dcp.save(
@@ -216,18 +228,21 @@ def test_model_wrapper_dcp_round_trip_overrides_unmanaged_replicated_dtensor(
 
         state_dict = ModelWrapper(model).state_dict()
 
-        assert isinstance(state_dict["layer.lora_A"], DTensor)
-        assert isinstance(state_dict["layer.lora_B"], DTensor)
+        lora_a_key = (
+            f"{_REPLICATED_TENSOR_STATE_PREFIX}layer.lora_A"
+        )
+        lora_b_key = (
+            f"{_REPLICATED_TENSOR_STATE_PREFIX}layer.lora_B"
+        )
+        assert isinstance(state_dict[lora_a_key], bytes)
+        assert isinstance(state_dict[lora_b_key], bytes)
         assert torch.equal(
-            state_dict["layer.lora_A"].to_local(),
+            _deserialize_replicated_tensor(state_dict[lora_a_key]),
             torch.tensor([7.0, 8.0]),
         )
         assert torch.equal(
-            state_dict["layer.lora_B"].to_local(),
+            _deserialize_replicated_tensor(state_dict[lora_b_key]),
             torch.tensor([9.0, 10.0]),
-        )
-        assert state_dict["layer.lora_A"].to_local().data_ptr() != (
-            model._lora_a.to_local().data_ptr()
         )
 
         loader_keys = []
