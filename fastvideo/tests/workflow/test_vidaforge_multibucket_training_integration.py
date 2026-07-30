@@ -1101,7 +1101,10 @@ _DTYPE_TOLERANCES = {
     torch.float64: (1e-7, 1e-7),
     torch.float32: (1.3e-6, 1e-5),
     torch.float16: (1e-3, 1e-5),
-    torch.bfloat16: (1.6e-2, 1e-5),
+    # Independent CUDA launches showed sparse (~0.2%) BF16 near-zero drift
+    # up to 1.97e-5. Keep the standard BF16 relative tolerance and allow
+    # 3e-5 absolute headroom without relaxing any same-run hash invariant.
+    torch.bfloat16: (1.6e-2, 3e-5),
 }
 
 
@@ -1204,6 +1207,46 @@ def test_entrypoint_state_snapshot_oracle_is_tensorwise_and_tolerant() -> None:
     assert "Mismatched elements" in message
     assert "Greatest absolute difference" in message
     assert "Greatest relative difference" in message
+
+    bf16_expected = {
+        "model": {
+            "layer.lora_A": torch.zeros(
+                2,
+                dtype=torch.bfloat16,
+            ),
+        },
+        "optimizer": {
+            "0:0:exp_avg": expected["optimizer"][
+                "0:0:exp_avg"
+            ].clone(),
+        },
+    }
+    bf16_actual = {
+        "model": {
+            "layer.lora_A": torch.tensor(
+                [2e-5, 0.0],
+                dtype=torch.bfloat16,
+            ),
+        },
+        "optimizer": {
+            "0:0:exp_avg": bf16_expected["optimizer"][
+                "0:0:exp_avg"
+            ].clone(),
+        },
+    }
+    _assert_entrypoint_state_snapshots_close(
+        bf16_actual,
+        bf16_expected,
+        label="sparse BF16 near-zero launch drift",
+    )
+
+    bf16_actual["model"]["layer.lora_A"][0] = 1e-3
+    with pytest.raises(AssertionError, match="model.layer.lora_A"):
+        _assert_entrypoint_state_snapshots_close(
+            bf16_actual,
+            bf16_expected,
+            label="material BF16 near-zero drift",
+        )
 
 
 def test_entrypoint_independent_loss_oracle_has_tight_tolerance() -> None:
