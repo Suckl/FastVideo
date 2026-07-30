@@ -69,8 +69,9 @@ def test_model_wrapper_adds_trainable_params_missing_from_fsdp_state(
     assert state_dict["layer.lora_B"].data_ptr() != model._lora_b.data_ptr()
 
 
-def test_model_wrapper_explicitly_restores_trainable_params(monkeypatch):
-    """Restore adapters that FSDP2 did not track when it was wrapped."""
+def test_model_wrapper_delegates_plain_trainable_params_to_loader(
+        monkeypatch):
+    """Ordinary trainable tensors still use the official state-dict loader."""
     model = DummyWrappedModule()
     wrapper = ModelWrapper(model)
     saved_state_dict = {
@@ -86,10 +87,10 @@ def test_model_wrapper_explicitly_restores_trainable_params(monkeypatch):
         **_kwargs,
     ):
         with torch.no_grad():
-            loaded_model._lora_a.zero_()
-            loaded_model._lora_b.zero_()
-            for value in model_state_dict.values():
-                value.zero_()
+            loaded_model._lora_a.copy_(
+                model_state_dict["layer.lora_A"])
+            loaded_model._lora_b.copy_(
+                model_state_dict["layer.lora_B"])
 
     monkeypatch.setattr(
         "fastvideo.training.checkpointing_utils.set_model_state_dict",
@@ -120,14 +121,25 @@ def test_model_wrapper_dcp_round_trip_overrides_unmanaged_replicated_dtensor(
     try:
         mesh = init_device_mesh("cpu", (1,))
         model = DummyWrappedModule()
-        current = DTensor.from_local(
+        current_a = DTensor.from_local(
             torch.tensor([7.0, 8.0]),
             device_mesh=mesh,
             placements=[Replicate()],
         )
-        model._lora_a = nn.Parameter(current)
-        stale = DTensor.from_local(
+        current_b = DTensor.from_local(
+            torch.tensor([9.0, 10.0]),
+            device_mesh=mesh,
+            placements=[Replicate()],
+        )
+        model._lora_a = nn.Parameter(current_a)
+        model._lora_b = nn.Parameter(current_b)
+        stale_a = DTensor.from_local(
             torch.tensor([-1.0, -2.0]),
+            device_mesh=mesh,
+            placements=[Replicate()],
+        )
+        stale_b = DTensor.from_local(
+            torch.tensor([-3.0, -4.0]),
             device_mesh=mesh,
             placements=[Replicate()],
         )
@@ -135,8 +147,8 @@ def test_model_wrapper_dcp_round_trip_overrides_unmanaged_replicated_dtensor(
         monkeypatch.setattr(
             "fastvideo.training.checkpointing_utils.get_model_state_dict",
             lambda _model: {
-                "layer.lora_A": stale,
-                "layer.lora_B": model._lora_b,
+                "layer.lora_A": stale_a,
+                "layer.lora_B": stale_b,
             },
         )
 
@@ -147,13 +159,26 @@ def test_model_wrapper_dcp_round_trip_overrides_unmanaged_replicated_dtensor(
             state_dict["layer.lora_A"],
             torch.tensor([7.0, 8.0]),
         )
+        assert torch.equal(
+            state_dict["layer.lora_B"],
+            torch.tensor([9.0, 10.0]),
+        )
         assert state_dict["layer.lora_A"].data_ptr() != (
             model._lora_a.to_local().data_ptr()
         )
 
+        loader_keys = []
+
+        def capture_set_model_state_dict(
+            _model,
+            model_state_dict,
+            **_kwargs,
+        ):
+            loader_keys.append(set(model_state_dict))
+
         monkeypatch.setattr(
             "fastvideo.training.checkpointing_utils.set_model_state_dict",
-            lambda *_args, **_kwargs: None,
+            capture_set_model_state_dict,
         )
         wrapper = ModelWrapper(model)
         checkpoint_dir = tmp_path / "dcp"
@@ -163,6 +188,7 @@ def test_model_wrapper_dcp_round_trip_overrides_unmanaged_replicated_dtensor(
         )
         with torch.no_grad():
             model._lora_a.to_local().zero_()
+            model._lora_b.to_local().zero_()
 
         dcp.load(
             {"model": wrapper},
@@ -173,5 +199,10 @@ def test_model_wrapper_dcp_round_trip_overrides_unmanaged_replicated_dtensor(
             model._lora_a.to_local(),
             torch.tensor([7.0, 8.0]),
         )
+        assert torch.equal(
+            model._lora_b.to_local(),
+            torch.tensor([9.0, 10.0]),
+        )
+        assert loader_keys == [set()]
     finally:
         dist.destroy_process_group()

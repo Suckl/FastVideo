@@ -41,30 +41,39 @@ class ModelWrapper(torch.distributed.checkpoint.stateful.Stateful):
         return filtered_state_dict
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        # FSDP2 tracks the parameters that existed when ``fully_shard`` ran.
-        # Trainable adapters may be attached afterwards (FastVideo's LoRA
-        # path does this), so ``set_model_state_dict`` can silently leave
-        # those DTensor parameters at their freshly initialized values when
-        # strict=False. Preserve independent copies before invoking the
-        # official loader because it may consume or mutate ``state_dict``.
-        # Restore the copies afterwards so neither that mutation nor any
-        # FSDP-managed write can overwrite post-FSDP adapters.
+        # LoRA adapters attached after ``fully_shard`` are replicated
+        # DTensors that FSDP does not manage.  Their DCP payload is a plain
+        # local tensor (see ``state_dict`` above), so passing those keys to
+        # ``set_model_state_dict`` attempts a mixed Tensor/DTensor ``copy_``.
+        # Keep independent copies, let the official loader handle all normal
+        # FSDP keys, then restore the adapters through their local storage.
         named_trainable_parameters = {
             name.replace("._checkpoint_wrapped_module.", "."): parameter
             for name, parameter in self.model.named_parameters() if parameter.requires_grad
         }
+        replicated_trainable_parameters = {
+            name: parameter
+            for name, parameter in named_trainable_parameters.items()
+            if isinstance(parameter, DTensor) and all(
+                isinstance(placement, Replicate)
+                for placement in parameter.placements)
+        }
         saved_trainable_parameters = {
             name: value.detach().clone()
-            for name, value in state_dict.items() if name in named_trainable_parameters
+            for name, value in state_dict.items() if name in replicated_trainable_parameters
+        }
+        fsdp_state_dict = {
+            name: value
+            for name, value in state_dict.items() if name not in replicated_trainable_parameters
         }
         set_model_state_dict(
             self.model,
-            model_state_dict=state_dict,
+            model_state_dict=fsdp_state_dict,
             options=StateDictOptions(strict=False),
         )
         with torch.no_grad():
             for name, value in saved_trainable_parameters.items():
-                parameter = named_trainable_parameters[name]
+                parameter = replicated_trainable_parameters[name]
                 destination = (parameter.to_local() if isinstance(parameter, DTensor) else parameter)
                 source = (value.to_local() if isinstance(value, DTensor) else value)
                 destination.copy_(source)
