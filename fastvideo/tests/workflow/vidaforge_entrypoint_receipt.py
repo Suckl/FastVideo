@@ -15,11 +15,7 @@ from torch.distributed.tensor import DTensor
 from fastvideo.pipelines import TrainingBatch
 from fastvideo.train.callbacks.callback import Callback
 from fastvideo.train.models.wan import WanModel
-from fastvideo.training.checkpointing_utils import (
-    ModelWrapper,
-    _deserialize_replicated_tensor,
-    _REPLICATED_TENSOR_STATE_PREFIX,
-)
+from fastvideo.training.checkpointing_utils import ModelWrapper
 
 _RECEIPT_DIR_ENV = "VIDAFORGE_ENTRYPOINT_RECEIPT_DIR"
 _RECEIPT_PHASE_ENV = "VIDAFORGE_ENTRYPOINT_RECEIPT_PHASE"
@@ -107,16 +103,6 @@ def _checkpoint_model_state_digest(
 ) -> str:
     digest = hashlib.sha256()
     for name, value in sorted(state_dict.items()):
-        if (
-            name.startswith(_REPLICATED_TENSOR_STATE_PREFIX)
-            and isinstance(value, bytes)
-        ):
-            _update_tensor_digest(
-                digest,
-                name=name[len(_REPLICATED_TENSOR_STATE_PREFIX):],
-                tensor=_deserialize_replicated_tensor(value),
-            )
-            continue
         if isinstance(value, torch.Tensor):
             _update_tensor_digest(
                 digest,

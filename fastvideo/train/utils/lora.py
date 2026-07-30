@@ -125,6 +125,41 @@ def _is_excluded_layer(
     return any(excluded in module_name for excluded in excluded_modules)
 
 
+def _register_replicated_gradient_sync(parameter: nn.Parameter, ) -> None:
+    """Average a late-added replicated parameter's gradient over its mesh.
+
+    FSDP cannot register reduction hooks for parameters attached after
+    ``fully_shard``. ``DTensor.to_local()`` keeps autograd connectivity but
+    does not reduce rank-local gradients for such unmanaged parameters.
+    Average over every replicated mesh dimension so each rank applies the
+    same optimizer update.
+    """
+
+    if not isinstance(parameter, DTensor):
+        return
+
+    replicated_dims = [
+        mesh_dim for mesh_dim, placement in enumerate(parameter.placements)
+        if isinstance(placement, Replicate) and parameter.device_mesh.size(mesh_dim) > 1
+    ]
+    if not replicated_dims:
+        return
+
+    def sync_gradient(param: torch.Tensor) -> None:
+        grad = param.grad
+        if grad is None:
+            return
+        local_grad = grad.to_local() if isinstance(grad, DTensor) else grad
+        for mesh_dim in replicated_dims:
+            dist.all_reduce(
+                local_grad,
+                group=parameter.device_mesh.get_group(mesh_dim),
+            )
+            local_grad.div_(parameter.device_mesh.size(mesh_dim))
+
+    parameter.register_post_accumulate_grad_hook(sync_gradient)
+
+
 def _replicate_lora_parameters(transformer: torch.nn.Module, ) -> None:
     """Wrap LoRA params in replicated DTensors when distributed is active.
 
@@ -186,7 +221,9 @@ def _replicate_lora_parameters(transformer: torch.nn.Module, ) -> None:
                 device_mesh=mesh,
                 placements=placements,
             )
-            setattr(module, attr_name, nn.Parameter(replicated))
+            replicated_parameter = nn.Parameter(replicated)
+            _register_replicated_gradient_sync(replicated_parameter)
+            setattr(module, attr_name, replicated_parameter)
 
 
 def enable_lora_training(

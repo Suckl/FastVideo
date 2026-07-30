@@ -7,11 +7,7 @@ from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate
 
-from fastvideo.training.checkpointing_utils import (
-    ModelWrapper,
-    _deserialize_replicated_tensor,
-    _REPLICATED_TENSOR_STATE_PREFIX,
-)
+from fastvideo.training.checkpointing_utils import ModelWrapper
 
 
 class DummyWrappedModule(nn.Module):
@@ -45,31 +41,33 @@ def _two_rank_replicated_adapter_dcp_worker(
             (1, 2),
             mesh_dim_names=("replicate", "shard"),
         )
+        lora_a_value = torch.tensor([7.0, 8.0])
+        lora_b_value = torch.tensor([9.0, 10.0])
         model = nn.Module()
         model.layer = nn.Module()
         model.layer.lora_A = nn.Parameter(
             DTensor.from_local(
-                torch.tensor([7.0, 8.0]),
+                lora_a_value,
                 device_mesh=mesh,
                 placements=[Replicate(), Replicate()],
             )
         )
         model.layer.lora_B = nn.Parameter(
             DTensor.from_local(
-                torch.tensor([9.0, 10.0]),
+                lora_b_value,
                 device_mesh=mesh,
                 placements=[Replicate(), Replicate()],
             )
         )
         wrapper = ModelWrapper(model)
         state_dict = wrapper.state_dict()
-        lora_a_key = (
-            f"{_REPLICATED_TENSOR_STATE_PREFIX}layer.lora_A"
-        )
-        assert isinstance(state_dict[lora_a_key], bytes)
+        assert isinstance(state_dict["layer.lora_A"], DTensor)
         assert torch.equal(
-            _deserialize_replicated_tensor(state_dict[lora_a_key]),
-            torch.tensor([7.0, 8.0]),
+            state_dict["layer.lora_A"].to_local(),
+            lora_a_value,
+        )
+        assert state_dict["layer.lora_A"].to_local().data_ptr() != (
+            model.layer.lora_A.to_local().data_ptr()
         )
 
         dcp.save(
@@ -228,21 +226,18 @@ def test_model_wrapper_dcp_round_trip_overrides_unmanaged_replicated_dtensor(
 
         state_dict = ModelWrapper(model).state_dict()
 
-        lora_a_key = (
-            f"{_REPLICATED_TENSOR_STATE_PREFIX}layer.lora_A"
-        )
-        lora_b_key = (
-            f"{_REPLICATED_TENSOR_STATE_PREFIX}layer.lora_B"
-        )
-        assert isinstance(state_dict[lora_a_key], bytes)
-        assert isinstance(state_dict[lora_b_key], bytes)
+        assert isinstance(state_dict["layer.lora_A"], DTensor)
+        assert isinstance(state_dict["layer.lora_B"], DTensor)
         assert torch.equal(
-            _deserialize_replicated_tensor(state_dict[lora_a_key]),
+            state_dict["layer.lora_A"].to_local(),
             torch.tensor([7.0, 8.0]),
         )
         assert torch.equal(
-            _deserialize_replicated_tensor(state_dict[lora_b_key]),
+            state_dict["layer.lora_B"].to_local(),
             torch.tensor([9.0, 10.0]),
+        )
+        assert state_dict["layer.lora_A"].to_local().data_ptr() != (
+            model._lora_a.to_local().data_ptr()
         )
 
         loader_keys = []
@@ -289,7 +284,7 @@ def test_model_wrapper_dcp_round_trip_overrides_unmanaged_replicated_dtensor(
 def test_model_wrapper_two_rank_dcp_round_trip_replicated_dtensor(
     tmp_path,
 ):
-    """A replicated DCP template must materialize on every rank."""
+    """A replicated DCP payload must materialize on every rank."""
     if dist.is_initialized():
         pytest.skip("requires ownership of the default process group")
 

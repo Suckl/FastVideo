@@ -784,6 +784,23 @@ def _run_entrypoint_training_and_resume(
     resumed_batches: list[dict[str, Any]] = []
     initial_posts: list[dict[str, Any]] = []
     resumed_posts: list[dict[str, Any]] = []
+    initial_post_receipts = [
+        _read_entrypoint_receipt(
+            receipt_dir,
+            phase="initial",
+            rank=rank,
+            kind="post-step",
+            index=1,
+        )
+        for rank in range(world_size)
+    ]
+    assert len({
+        receipt["trainable_model_sha256"]
+        for receipt in initial_post_receipts
+    }) == 1, (
+        "LoRA replicas diverged before checkpoint save: "
+        f"{json.dumps(initial_post_receipts, sort_keys=True)}"
+    )
     for rank in range(world_size):
         initial_batch = _read_entrypoint_receipt(
             receipt_dir,
@@ -832,13 +849,7 @@ def _run_entrypoint_training_and_resume(
             for placement in example["placements"]
         )
 
-        initial_post = _read_entrypoint_receipt(
-            receipt_dir,
-            phase="initial",
-            rank=rank,
-            kind="post-step",
-            index=1,
-        )
+        initial_post = initial_post_receipts[rank]
         resumed_post = _read_entrypoint_receipt(
             receipt_dir,
             phase="resumed",
