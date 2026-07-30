@@ -15,7 +15,10 @@ from torch.distributed.tensor import DTensor
 from fastvideo.pipelines import TrainingBatch
 from fastvideo.train.callbacks.callback import Callback
 from fastvideo.train.models.wan import WanModel
-from fastvideo.training.checkpointing_utils import ModelWrapper
+from fastvideo.training.checkpointing_utils import (
+    ModelWrapper,
+    OptimizerWrapper,
+)
 
 _RECEIPT_DIR_ENV = "VIDAFORGE_ENTRYPOINT_RECEIPT_DIR"
 _RECEIPT_PHASE_ENV = "VIDAFORGE_ENTRYPOINT_RECEIPT_PHASE"
@@ -146,6 +149,38 @@ def _optimizer_digest(optimizer: torch.optim.Optimizer) -> str:
                     )
                     digest.update(b"\0")
     return digest.hexdigest()
+
+
+def _checkpoint_optimizer_state_digest(
+    state_dict: dict[str, Any],
+) -> str:
+    digest = hashlib.sha256()
+    for name, value in sorted(state_dict.items()):
+        if isinstance(value, torch.Tensor):
+            _update_tensor_digest(
+                digest,
+                name=name,
+                tensor=value,
+            )
+        else:
+            digest.update(name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(
+                json.dumps(value, sort_keys=True).encode("utf-8")
+            )
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _student_checkpoint_optimizer_digest(method: Any) -> str:
+    wrapper = method.checkpoint_state()["optimizers.student"]
+    if not isinstance(wrapper, OptimizerWrapper):
+        raise TypeError(
+            "optimizers.student must be an OptimizerWrapper"
+        )
+    return _checkpoint_optimizer_state_digest(
+        _ORIGINAL_OPTIMIZER_WRAPPER_STATE_DICT(wrapper)
+    )
 
 
 def _trainable_model_snapshot(
@@ -284,6 +319,9 @@ class Section6ReceiptCallback(Callback):
             "optimizer_sha256": _optimizer_digest(
                 method._student_optimizer
             ),
+            "checkpoint_optimizer_sha256": (
+                _student_checkpoint_optimizer_digest(method)
+            ),
             "total_loss": float(loss_dict["total_loss"]),
         }
         _receipt_path("post-step", iteration).write_text(
@@ -304,7 +342,14 @@ class Section6ReceiptCallback(Callback):
 
 _ORIGINAL_MODEL_WRAPPER_STATE_DICT = ModelWrapper.state_dict
 _ORIGINAL_MODEL_WRAPPER_LOAD_STATE_DICT = ModelWrapper.load_state_dict
+_ORIGINAL_OPTIMIZER_WRAPPER_STATE_DICT = (
+    OptimizerWrapper.state_dict
+)
+_ORIGINAL_OPTIMIZER_WRAPPER_LOAD_STATE_DICT = (
+    OptimizerWrapper.load_state_dict
+)
 _MODEL_WRAPPER_STATE_DICT_INDEX = 0
+_OPTIMIZER_WRAPPER_STATE_DICT_INDEX = 0
 
 
 def _observed_model_wrapper_state_dict(
@@ -356,5 +401,68 @@ def _observed_model_wrapper_load_state_dict(
     )
 
 
+def _observed_optimizer_wrapper_state_dict(
+    wrapper: OptimizerWrapper,
+) -> dict[str, Any]:
+    """Expose exact optimizer state before/after DCP state capture."""
+
+    global _OPTIMIZER_WRAPPER_STATE_DICT_INDEX
+    before_state = _ORIGINAL_OPTIMIZER_WRAPPER_STATE_DICT(wrapper)
+    state_dict = _ORIGINAL_OPTIMIZER_WRAPPER_STATE_DICT(wrapper)
+    after_state = _ORIGINAL_OPTIMIZER_WRAPPER_STATE_DICT(wrapper)
+    _OPTIMIZER_WRAPPER_STATE_DICT_INDEX += 1
+    receipt = {
+        "rank": _rank(),
+        "state_keys": sorted(state_dict),
+        "before_optimizer_sha256": (
+            _checkpoint_optimizer_state_digest(before_state)
+        ),
+        "after_optimizer_sha256": (
+            _checkpoint_optimizer_state_digest(after_state)
+        ),
+        "payload_sha256": (
+            _checkpoint_optimizer_state_digest(state_dict)
+        ),
+    }
+    _receipt_path(
+        "optimizer-checkpoint-state-dict",
+        _OPTIMIZER_WRAPPER_STATE_DICT_INDEX,
+    ).write_text(
+        json.dumps(receipt, sort_keys=True),
+        encoding="utf-8",
+    )
+    return state_dict
+
+
+def _observed_optimizer_wrapper_load_state_dict(
+    wrapper: OptimizerWrapper,
+    state_dict: dict[str, Any],
+) -> None:
+    """Expose the materialized optimizer payload and restored live state."""
+
+    payload_digest = _checkpoint_optimizer_state_digest(state_dict)
+    _ORIGINAL_OPTIMIZER_WRAPPER_LOAD_STATE_DICT(
+        wrapper,
+        state_dict,
+    )
+    restored_state = _ORIGINAL_OPTIMIZER_WRAPPER_STATE_DICT(wrapper)
+    receipt = {
+        "rank": _rank(),
+        "state_keys": sorted(state_dict),
+        "payload_sha256": payload_digest,
+        "restored_optimizer_sha256": (
+            _checkpoint_optimizer_state_digest(restored_state)
+        ),
+    }
+    _receipt_path("optimizer-checkpoint-load", 0).write_text(
+        json.dumps(receipt, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
 ModelWrapper.state_dict = _observed_model_wrapper_state_dict
 ModelWrapper.load_state_dict = _observed_model_wrapper_load_state_dict
+OptimizerWrapper.state_dict = _observed_optimizer_wrapper_state_dict
+OptimizerWrapper.load_state_dict = (
+    _observed_optimizer_wrapper_load_state_dict
+)
