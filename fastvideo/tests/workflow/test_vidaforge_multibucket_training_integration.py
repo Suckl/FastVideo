@@ -1144,14 +1144,18 @@ def _assert_entrypoint_state_snapshots_close(
                 )
                 continue
             rtol, atol = tolerances
-            torch.testing.assert_close(
-                actual_tensor,
-                expected_tensor,
-                rtol=rtol,
-                atol=atol,
-                equal_nan=True,
-                msg=f"{label} {role}.{name} differs",
-            )
+            try:
+                torch.testing.assert_close(
+                    actual_tensor,
+                    expected_tensor,
+                    rtol=rtol,
+                    atol=atol,
+                    equal_nan=True,
+                )
+            except AssertionError as error:
+                raise AssertionError(
+                    f"{label} {role}.{name} differs:\n{error}"
+                ) from error
 
 
 def test_entrypoint_state_snapshot_oracle_is_tensorwise_and_tolerant() -> None:
@@ -1189,12 +1193,17 @@ def test_entrypoint_state_snapshot_oracle_is_tensorwise_and_tolerant() -> None:
     )
 
     actual["optimizer"]["0:0:exp_avg"][0] += 1e-2
-    with pytest.raises(AssertionError, match="0:0:exp_avg"):
+    with pytest.raises(AssertionError) as error:
         _assert_entrypoint_state_snapshots_close(
             actual,
             expected,
             label="divergent independent runs",
         )
+    message = str(error.value)
+    assert "optimizer.0:0:exp_avg" in message
+    assert "Mismatched elements" in message
+    assert "Greatest absolute difference" in message
+    assert "Greatest relative difference" in message
 
 
 def test_entrypoint_independent_loss_oracle_has_tight_tolerance() -> None:
