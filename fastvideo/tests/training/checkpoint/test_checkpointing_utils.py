@@ -1,6 +1,7 @@
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+import torch.multiprocessing as mp
 import pytest
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
@@ -21,6 +22,67 @@ class DummyWrappedModule(nn.Module):
         yield "layer._checkpoint_wrapped_module.lora_A", self._lora_a
         yield "layer._checkpoint_wrapped_module.lora_B", self._lora_b
         yield "layer._checkpoint_wrapped_module.frozen_weight", self._frozen
+
+
+def _two_rank_replicated_adapter_dcp_worker(
+    rank,
+    init_method,
+    checkpoint_dir,
+):
+    dist.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=2,
+    )
+    try:
+        mesh = init_device_mesh("cpu", (2,))
+        model = nn.Module()
+        model.layer = nn.Module()
+        model.layer.lora_A = nn.Parameter(
+            DTensor.from_local(
+                torch.tensor([7.0, 8.0]),
+                device_mesh=mesh,
+                placements=[Replicate()],
+            )
+        )
+        model.layer.lora_B = nn.Parameter(
+            DTensor.from_local(
+                torch.tensor([9.0, 10.0]),
+                device_mesh=mesh,
+                placements=[Replicate()],
+            )
+        )
+        wrapper = ModelWrapper(model)
+        state_dict = wrapper.state_dict()
+        assert isinstance(state_dict["layer.lora_A"], DTensor)
+        assert state_dict["layer.lora_A"].to_local().data_ptr() != (
+            model.layer.lora_A.to_local().data_ptr()
+        )
+
+        dcp.save(
+            {"model": wrapper},
+            checkpoint_id=checkpoint_dir,
+        )
+        with torch.no_grad():
+            model.layer.lora_A.to_local().zero_()
+            model.layer.lora_B.to_local().zero_()
+
+        dcp.load(
+            {"model": wrapper},
+            checkpoint_id=checkpoint_dir,
+        )
+
+        assert torch.equal(
+            model.layer.lora_A.to_local(),
+            torch.tensor([7.0, 8.0]),
+        )
+        assert torch.equal(
+            model.layer.lora_B.to_local(),
+            torch.tensor([9.0, 10.0]),
+        )
+    finally:
+        dist.destroy_process_group()
 
 
 def test_model_wrapper_filters_wrapped_trainable_params(monkeypatch):
@@ -154,16 +216,17 @@ def test_model_wrapper_dcp_round_trip_overrides_unmanaged_replicated_dtensor(
 
         state_dict = ModelWrapper(model).state_dict()
 
-        assert not isinstance(state_dict["layer.lora_A"], DTensor)
+        assert isinstance(state_dict["layer.lora_A"], DTensor)
+        assert isinstance(state_dict["layer.lora_B"], DTensor)
         assert torch.equal(
-            state_dict["layer.lora_A"],
+            state_dict["layer.lora_A"].to_local(),
             torch.tensor([7.0, 8.0]),
         )
         assert torch.equal(
-            state_dict["layer.lora_B"],
+            state_dict["layer.lora_B"].to_local(),
             torch.tensor([9.0, 10.0]),
         )
-        assert state_dict["layer.lora_A"].data_ptr() != (
+        assert state_dict["layer.lora_A"].to_local().data_ptr() != (
             model._lora_a.to_local().data_ptr()
         )
 
@@ -206,3 +269,20 @@ def test_model_wrapper_dcp_round_trip_overrides_unmanaged_replicated_dtensor(
         assert loader_keys == [set()]
     finally:
         dist.destroy_process_group()
+
+
+def test_model_wrapper_two_rank_dcp_round_trip_replicated_dtensor(
+    tmp_path,
+):
+    """A replicated DCP template must materialize on every rank."""
+    if dist.is_initialized():
+        pytest.skip("requires ownership of the default process group")
+
+    rendezvous = (tmp_path / "two-rank-rendezvous").resolve().as_uri()
+    checkpoint_dir = str(tmp_path / "two-rank-dcp")
+    mp.spawn(
+        _two_rank_replicated_adapter_dcp_worker,
+        args=(rendezvous, checkpoint_dir),
+        nprocs=2,
+        join=True,
+    )

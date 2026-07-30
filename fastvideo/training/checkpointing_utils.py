@@ -28,13 +28,15 @@ class ModelWrapper(torch.distributed.checkpoint.stateful.Stateful):
         # but they are not managed by FSDP.  ``get_model_state_dict`` still
         # exposes them, so using ``setdefault`` here would retain those
         # unmanaged DTensors and DCP would build its load template from them.
-        # Always serialize fully-replicated trainables as independent local
-        # tensors.  Keep normal FSDP Shard parameters untouched so DCP can
-        # preserve their global layout.
+        # Always serialize fully-replicated trainables as independent
+        # DTensors. DCP needs their mesh/placements to materialize the payload
+        # on every rank; a plain local tensor template is not sufficient in a
+        # multi-rank load. Keep normal FSDP Shard parameters untouched so DCP
+        # can preserve their global layout.
         for name, parameter in trainable_parameters.items():
             if isinstance(parameter, DTensor) and all(
                     isinstance(placement, Replicate) for placement in parameter.placements):
-                filtered_state_dict[name] = parameter.to_local().detach().clone()
+                filtered_state_dict[name] = parameter.detach().clone()
             elif name not in filtered_state_dict:
                 filtered_state_dict[name] = parameter.detach().clone()
 
@@ -42,11 +44,9 @@ class ModelWrapper(torch.distributed.checkpoint.stateful.Stateful):
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         # LoRA adapters attached after ``fully_shard`` are replicated
-        # DTensors that FSDP does not manage.  Their DCP payload is a plain
-        # local tensor (see ``state_dict`` above), so passing those keys to
-        # ``set_model_state_dict`` attempts a mixed Tensor/DTensor ``copy_``.
-        # Keep independent copies, let the official loader handle all normal
-        # FSDP keys, then restore the adapters through their local storage.
+        # DTensors that FSDP does not manage. Keep independent copies of
+        # their DCP payload, let the official loader handle only normal FSDP
+        # keys, then restore the adapters through their local storage.
         named_trainable_parameters = {
             name.replace("._checkpoint_wrapped_module.", "."): parameter
             for name, parameter in self.model.named_parameters() if parameter.requires_grad
