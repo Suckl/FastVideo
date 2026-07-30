@@ -801,6 +801,34 @@ def _run_entrypoint_training_and_resume(
         "LoRA replicas diverged before checkpoint save: "
         f"{json.dumps(initial_post_receipts, sort_keys=True)}"
     )
+    # Compare full tensor state before the scalar loss oracle so actionable
+    # model/optimizer drift is reported ahead of derived BF16 loss drift.
+    _assert_entrypoint_state_snapshots_close(
+        _read_entrypoint_state_snapshot(
+            receipt_dir,
+            phase="initial",
+            iteration=1,
+        ),
+        _read_entrypoint_state_snapshot(
+            receipt_dir,
+            phase="continuous",
+            iteration=1,
+        ),
+        label="rank 0 initial vs continuous step 1",
+    )
+    _assert_entrypoint_state_snapshots_close(
+        _read_entrypoint_state_snapshot(
+            receipt_dir,
+            phase="resumed",
+            iteration=2,
+        ),
+        _read_entrypoint_state_snapshot(
+            receipt_dir,
+            phase="continuous",
+            iteration=2,
+        ),
+        label="rank 0 resumed vs continuous step 2",
+    )
     for rank in range(world_size):
         initial_batch = _read_entrypoint_receipt(
             receipt_dir,
@@ -939,33 +967,6 @@ def _run_entrypoint_training_and_resume(
         initial_posts.append(initial_post)
         resumed_posts.append(resumed_post)
 
-    _assert_entrypoint_state_snapshots_close(
-        _read_entrypoint_state_snapshot(
-            receipt_dir,
-            phase="initial",
-            iteration=1,
-        ),
-        _read_entrypoint_state_snapshot(
-            receipt_dir,
-            phase="continuous",
-            iteration=1,
-        ),
-        label="rank 0 initial vs continuous step 1",
-    )
-    _assert_entrypoint_state_snapshots_close(
-        _read_entrypoint_state_snapshot(
-            receipt_dir,
-            phase="resumed",
-            iteration=2,
-        ),
-        _read_entrypoint_state_snapshot(
-            receipt_dir,
-            phase="continuous",
-            iteration=2,
-        ),
-        label="rank 0 resumed vs continuous step 2",
-    )
-
     # LoRA parameters use replicated DTensor placements and must begin and
     # remain identical across data-parallel ranks.
     assert len({
@@ -1078,17 +1079,21 @@ def _assert_entrypoint_post_step_metrics_match(
     *,
     label: str,
 ) -> None:
-    keys = (
-        "iteration",
-        "total_loss",
+    assert actual["iteration"] == expected["iteration"], (
+        f"{label}: iteration mismatch: "
+        f"{actual['iteration']} != {expected['iteration']}"
     )
-    mismatches = {
-        key: {"actual": actual[key], "expected": expected[key]}
-        for key in keys
-        if actual[key] != expected[key]
-    }
-    assert not mismatches, (
-        f"{label}: {json.dumps(mismatches, sort_keys=True)}"
+    actual_loss = float(actual["total_loss"])
+    expected_loss = float(expected["total_loss"])
+    assert math.isclose(
+        actual_loss,
+        expected_loss,
+        rel_tol=1e-3,
+        abs_tol=1e-5,
+    ), (
+        f"{label}: total_loss mismatch outside "
+        f"rtol=1e-3, atol=1e-5: "
+        f"{actual_loss} != {expected_loss}"
     )
 
 
@@ -1189,6 +1194,40 @@ def test_entrypoint_state_snapshot_oracle_is_tensorwise_and_tolerant() -> None:
             actual,
             expected,
             label="divergent independent runs",
+        )
+
+
+def test_entrypoint_independent_loss_oracle_has_tight_tolerance() -> None:
+    expected = {
+        "iteration": 2,
+        "total_loss": 0.050285082310438156,
+    }
+    _assert_entrypoint_post_step_metrics_match(
+        {
+            "iteration": 2,
+            "total_loss": 0.050249386578798294,
+        },
+        expected,
+        label="observed BF16 propagation drift",
+    )
+
+    with pytest.raises(AssertionError, match="total_loss"):
+        _assert_entrypoint_post_step_metrics_match(
+            {
+                "iteration": 2,
+                "total_loss": 0.05015,
+            },
+            expected,
+            label="material loss drift",
+        )
+    with pytest.raises(AssertionError, match="iteration"):
+        _assert_entrypoint_post_step_metrics_match(
+            {
+                "iteration": 3,
+                "total_loss": expected["total_loss"],
+            },
+            expected,
+            label="wrong training step",
         )
 
 
