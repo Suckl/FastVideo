@@ -37,6 +37,16 @@ def _receipt_path(kind: str, index: int) -> Path:
     )
 
 
+def _snapshot_path(kind: str, index: int) -> Path:
+    receipt_dir = Path(os.environ[_RECEIPT_DIR_ENV])
+    phase = os.environ[_RECEIPT_PHASE_ENV]
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    return (
+        receipt_dir
+        / f"{phase}-rank-{_rank():05d}-{kind}-{index:05d}.pt"
+    )
+
+
 def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
     if isinstance(tensor, DTensor):
         tensor = tensor.to_local()
@@ -136,6 +146,34 @@ def _optimizer_digest(optimizer: torch.optim.Optimizer) -> str:
                     )
                     digest.update(b"\0")
     return digest.hexdigest()
+
+
+def _trainable_model_snapshot(
+    model: WanModel,
+) -> dict[str, torch.Tensor]:
+    return {
+        name.replace(
+            "._checkpoint_wrapped_module.",
+            ".",
+        ): _local_tensor(parameter).clone()
+        for name, parameter in model.transformer.named_parameters()
+        if parameter.requires_grad
+    }
+
+
+def _optimizer_snapshot(
+    optimizer: torch.optim.Optimizer,
+) -> dict[str, torch.Tensor]:
+    snapshot: dict[str, torch.Tensor] = {}
+    for group_index, group in enumerate(optimizer.param_groups):
+        for parameter_index, parameter in enumerate(group["params"]):
+            state = optimizer.state.get(parameter, {})
+            for key in sorted(state):
+                value = state[key]
+                if isinstance(value, torch.Tensor):
+                    name = f"{group_index}:{parameter_index}:{key}"
+                    snapshot[name] = _local_tensor(value).clone()
+    return snapshot
 
 
 def _parameter_placement_receipt(
@@ -252,6 +290,16 @@ class Section6ReceiptCallback(Callback):
             json.dumps(receipt, sort_keys=True),
             encoding="utf-8",
         )
+        if _rank() == 0:
+            torch.save(
+                {
+                    "model": _trainable_model_snapshot(method.student),
+                    "optimizer": _optimizer_snapshot(
+                        method._student_optimizer
+                    ),
+                },
+                _snapshot_path("post-step-state", iteration),
+            )
 
 
 _ORIGINAL_MODEL_WRAPPER_STATE_DICT = ModelWrapper.state_dict

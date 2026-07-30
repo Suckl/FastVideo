@@ -921,23 +921,50 @@ def _run_entrypoint_training_and_resume(
         assert continuous_first_post["trainable_model_sha256"] == (
             continuous_second_batch["pre_step_trainable_model_sha256"]
         ), f"rank {rank} checkpoint save mutated the live LoRA state"
-        _assert_entrypoint_post_step_receipts_match(
+        _assert_entrypoint_post_step_metrics_match(
             initial_post,
             continuous_first_post,
             label=f"rank {rank} initial vs continuous step 1",
         )
-        _assert_entrypoint_batch_receipts_match(
+        _assert_entrypoint_batch_data_match(
             resumed_batch,
             continuous_second_batch,
             label=f"rank {rank} resumed vs continuous step 2",
         )
-        _assert_entrypoint_post_step_receipts_match(
+        _assert_entrypoint_post_step_metrics_match(
             resumed_post,
             continuous_second_post,
             label=f"rank {rank} resumed vs continuous step 2",
         )
         initial_posts.append(initial_post)
         resumed_posts.append(resumed_post)
+
+    _assert_entrypoint_state_snapshots_close(
+        _read_entrypoint_state_snapshot(
+            receipt_dir,
+            phase="initial",
+            iteration=1,
+        ),
+        _read_entrypoint_state_snapshot(
+            receipt_dir,
+            phase="continuous",
+            iteration=1,
+        ),
+        label="rank 0 initial vs continuous step 1",
+    )
+    _assert_entrypoint_state_snapshots_close(
+        _read_entrypoint_state_snapshot(
+            receipt_dir,
+            phase="resumed",
+            iteration=2,
+        ),
+        _read_entrypoint_state_snapshot(
+            receipt_dir,
+            phase="continuous",
+            iteration=2,
+        ),
+        label="rank 0 resumed vs continuous step 2",
+    )
 
     # LoRA parameters use replicated DTensor placements and must begin and
     # remain identical across data-parallel ranks.
@@ -978,6 +1005,26 @@ def _read_entrypoint_receipt(
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _read_entrypoint_state_snapshot(
+    receipt_dir: Path,
+    *,
+    phase: str,
+    iteration: int,
+) -> dict[str, dict[str, torch.Tensor]]:
+    path = (
+        receipt_dir
+        / (
+            f"{phase}-rank-00000-post-step-state-"
+            f"{iteration:05d}.pt"
+        )
+    )
+    return torch.load(
+        path,
+        map_location="cpu",
+        weights_only=True,
+    )
+
+
 def _assert_entrypoint_batch_receipts_match(
     actual: dict[str, Any],
     expected: dict[str, Any],
@@ -1002,7 +1049,30 @@ def _assert_entrypoint_batch_receipts_match(
     )
 
 
-def _assert_entrypoint_post_step_receipts_match(
+def _assert_entrypoint_batch_data_match(
+    actual: dict[str, Any],
+    expected: dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    keys = (
+        "clip_ids",
+        "bucket_frame_counts",
+        "bucket_resolutions",
+        "noise_sha256",
+        "timesteps_sha256",
+    )
+    mismatches = {
+        key: {"actual": actual[key], "expected": expected[key]}
+        for key in keys
+        if actual[key] != expected[key]
+    }
+    assert not mismatches, (
+        f"{label}: {json.dumps(mismatches, sort_keys=True)}"
+    )
+
+
+def _assert_entrypoint_post_step_metrics_match(
     actual: dict[str, Any],
     expected: dict[str, Any],
     *,
@@ -1010,8 +1080,6 @@ def _assert_entrypoint_post_step_receipts_match(
 ) -> None:
     keys = (
         "iteration",
-        "trainable_model_sha256",
-        "optimizer_sha256",
         "total_loss",
     )
     mismatches = {
@@ -1022,6 +1090,106 @@ def _assert_entrypoint_post_step_receipts_match(
     assert not mismatches, (
         f"{label}: {json.dumps(mismatches, sort_keys=True)}"
     )
+
+
+_DTYPE_TOLERANCES = {
+    torch.float64: (1e-7, 1e-7),
+    torch.float32: (1.3e-6, 1e-5),
+    torch.float16: (1e-3, 1e-5),
+    torch.bfloat16: (1.6e-2, 1e-5),
+}
+
+
+def _assert_entrypoint_state_snapshots_close(
+    actual: dict[str, dict[str, torch.Tensor]],
+    expected: dict[str, dict[str, torch.Tensor]],
+    *,
+    label: str,
+) -> None:
+    """Compare independent CUDA runs tensor-by-tensor.
+
+    Tolerances match PyTorch's dtype-specific ``assert_close`` defaults.
+    Hashes remain authoritative for same-run save/load and cross-rank checks;
+    this numeric oracle is used only across independently launched processes.
+    """
+
+    assert set(actual) == {"model", "optimizer"}
+    assert set(expected) == {"model", "optimizer"}
+    for role in ("model", "optimizer"):
+        actual_tensors = actual[role]
+        expected_tensors = expected[role]
+        assert set(actual_tensors) == set(expected_tensors), (
+            f"{label} {role} tensor keys differ"
+        )
+        for name in sorted(actual_tensors):
+            actual_tensor = actual_tensors[name]
+            expected_tensor = expected_tensors[name]
+            assert actual_tensor.shape == expected_tensor.shape, (
+                f"{label} {role}.{name} shape mismatch: "
+                f"{actual_tensor.shape} != {expected_tensor.shape}"
+            )
+            assert actual_tensor.dtype == expected_tensor.dtype, (
+                f"{label} {role}.{name} dtype mismatch: "
+                f"{actual_tensor.dtype} != {expected_tensor.dtype}"
+            )
+            tolerances = _DTYPE_TOLERANCES.get(actual_tensor.dtype)
+            if tolerances is None:
+                assert torch.equal(actual_tensor, expected_tensor), (
+                    f"{label} {role}.{name} differs"
+                )
+                continue
+            rtol, atol = tolerances
+            torch.testing.assert_close(
+                actual_tensor,
+                expected_tensor,
+                rtol=rtol,
+                atol=atol,
+                equal_nan=True,
+                msg=f"{label} {role}.{name} differs",
+            )
+
+
+def test_entrypoint_state_snapshot_oracle_is_tensorwise_and_tolerant() -> None:
+    expected = {
+        "model": {
+            "layer.lora_A": torch.tensor(
+                [1.0, 2.0],
+                dtype=torch.bfloat16,
+            ),
+        },
+        "optimizer": {
+            "0:0:exp_avg": torch.tensor(
+                [0.1, 0.2],
+                dtype=torch.float32,
+            ),
+        },
+    }
+    actual = {
+        "model": {
+            "layer.lora_A": expected["model"][
+                "layer.lora_A"
+            ].clone(),
+        },
+        "optimizer": {
+            "0:0:exp_avg": (
+                expected["optimizer"]["0:0:exp_avg"]
+                + torch.tensor([1e-7, -1e-7])
+            ),
+        },
+    }
+    _assert_entrypoint_state_snapshots_close(
+        actual,
+        expected,
+        label="close independent runs",
+    )
+
+    actual["optimizer"]["0:0:exp_avg"][0] += 1e-2
+    with pytest.raises(AssertionError, match="0:0:exp_avg"):
+        _assert_entrypoint_state_snapshots_close(
+            actual,
+            expected,
+            label="divergent independent runs",
+        )
 
 
 def test_entrypoint_phase_uses_documented_two_rank_fsdp_recipe(
